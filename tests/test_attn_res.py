@@ -130,3 +130,77 @@ if __name__ == "__main__":
         print(f"(n={n:5d}, J={J}, d={D}): eager jvp {t_eg:7.3f} ms  "
               f"triton jvp {t_tr:6.3f} ms ({t_eg/t_tr:5.2f}x)  "
               f"triton fwd {t_fw:6.3f} ms")
+
+
+def eager_apply_grad(v, w, eps=EPS):
+    """Same as eager_apply but differentiable w.r.t. w too (no fusion)."""
+    return eager_apply(v, w, eps)
+
+
+def test_backward_matches_eager():
+    """attn_res_op gradients (gv, gw) vs eager fp64 autograd."""
+    from models.triton_attn_res_jvp import attn_res_op
+
+    torch.manual_seed(4)
+    n, J = 512, 6
+    v = torch.randn(n, J, D, device="cuda", requires_grad=True)  # (n, J, d)
+    w = torch.randn(D, device="cuda", requires_grad=True)        # (d,)
+    gy = torch.randn(n, D, device="cuda")                        # (n, d)
+
+    v64 = v.detach().double().requires_grad_(True)
+    w64 = w.detach().double().requires_grad_(True)
+    y64 = eager_apply_grad(v64, w64)
+    gv64, gw64 = torch.autograd.grad(y64, (v64, w64), gy.double())
+
+    y = attn_res_op(v, w, EPS)
+    gv, gw = torch.autograd.grad(y, (v, w), gy)
+    assert rel_err(y, y64) < 1e-5
+    assert rel_err(gv, gv64) < 1e-5, f"gv rel err {rel_err(gv, gv64):.2e}"
+    assert rel_err(gw, gw64) < 1e-5, f"gw rel err {rel_err(gw, gw64):.2e}"
+
+
+def test_function_jvp_matches_eager():
+    """attn_res_op under torch.func.jvp vs eager jvp."""
+    from models.triton_attn_res_jvp import attn_res_op
+
+    torch.manual_seed(5)
+    n, J = 256, 4
+    v = torch.randn(n, J, D, device="cuda")            # (n, J, d)
+    dv = torch.randn(n, J, D, device="cuda")           # (n, J, d)
+    w = torch.randn(D, device="cuda")                  # (d,)
+    y_r, dy_r = torch.func.jvp(lambda t: eager_apply(t, w), (v,), (dv,))
+    y, dy = torch.func.jvp(lambda t: attn_res_op(t, w, EPS), (v,), (dv,))
+    assert rel_err(y, y_r) < 1e-5 and rel_err(dy, dy_r) < 1e-5
+
+
+def test_model_helper_dispatches_and_grads():
+    """attn_res_apply CUDA fp32 path (Triton) vs forced-eager, incl. grads
+    into snapshots, prefix, gain and projection."""
+    torch.manual_seed(6)
+    b, l, J = 2, 210, 4
+    snaps = [torch.randn(b, l, D, device="cuda", requires_grad=True)
+             for _ in range(J - 1)]                    # each (b, l, d)
+    prefix = torch.randn(b, l, D, device="cuda", requires_grad=True)
+    gain = (torch.rand(D, device="cuda") + 0.5).requires_grad_(True)
+    proj = torch.randn(1, D, device="cuda", requires_grad=True)
+    gy = torch.randn(b, l, D, device="cuda")
+
+    out = attn_res_apply(prefix, snaps, gain, proj, EPS)     # Triton path
+    grads = torch.autograd.grad(out, [prefix, gain, proj] + snaps, gy)
+
+    v64 = torch.stack([s.detach().double() for s in snaps]
+                      + [prefix.detach().double()], dim=2).reshape(-1, J, D)
+    v64 = v64.requires_grad_(True)
+    w64 = (gain.detach().double() * proj.detach().double().reshape(-1))
+    g64 = gain.detach().double().requires_grad_(True)
+    p64 = proj.detach().double().requires_grad_(True)
+    y64 = eager_apply(v64, g64 * p64.reshape(-1))
+    gv64, gg64, gp64 = torch.autograd.grad(
+        y64, (v64, g64, p64), gy.double().reshape(-1, D)
+    )
+    gv64 = gv64.reshape(b, l, J, D)
+    assert rel_err(grads[0], gv64[:, :, -1]) < 1e-5          # prefix grad
+    assert rel_err(grads[1], gg64) < 1e-5                    # gain grad
+    assert rel_err(grads[2], gp64) < 1e-5                    # proj grad
+    for i in range(J - 1):
+        assert rel_err(grads[3 + i], gv64[:, :, i]) < 1e-5   # snapshot grads

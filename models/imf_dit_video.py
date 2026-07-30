@@ -240,10 +240,16 @@ def attn_res_apply(prefix, snaps, gain, proj_w, eps=1e-6):
         (b, l, d) re-mixed residual stream, in prefix.dtype.
     """
     v = torch.stack(list(snaps) + [prefix], dim=2)      # (b, l, J, d)
+    w = gain.float() * proj_w.reshape(-1).float()       # (d,) fused score dir
+    if prefix.is_cuda and prefix.dtype == torch.float32:
+        # fused Triton path (forward, backward and forward-mode JVP)
+        from models.triton_attn_res_jvp import attn_res_op
+
+        b, l, J, d = v.shape
+        return attn_res_op(v.reshape(b * l, J, d), w, eps).view(b, l, d)
     vf = v.float()
     var = vf.pow(2).mean(-1, keepdim=True)              # (b, l, J, 1)
     k = vf * torch.rsqrt(var + eps)                     # (b, l, J, d) RMS-normed
-    w = gain.float() * proj_w.reshape(-1).float()       # (d,) fused score dir
     scores = torch.einsum("bljd,d->blj", k, w)          # (b, l, J)
     probs = scores.softmax(-1)                          # (b, l, J)
     out = torch.einsum("blj,bljd->bld", probs, vf)      # (b, l, d)

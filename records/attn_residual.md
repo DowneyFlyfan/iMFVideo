@@ -74,3 +74,23 @@ dy = einsum("nj,njd->nd", dp, v) \
 - `tests/test_attn_res.py` — correctness + speed; `__main__` benchmark
 
 - `config.py` — `attn_res_block_size` knob; `train.py` — wiring
+
+## Training-path integration (autograd + forward AD)
+
+- `attn_res_op` (`models/triton_attn_res_jvp.py`): `torch.autograd.Function` with the fused Triton forward, a fused Triton backward kernel (input gradients; the score-direction gradient reduces the per-row gs/r workspace with one matmul: `gw = einsum("x,xd->d", gsr, v)`), and a functorch `jvp` staticmethod calling the fused primal+tangent kernel (supports a nonzero score-direction tangent). `imf_dit_video.attn_res_apply` dispatches to it for CUDA fp32; eager math remains the fallback and the reference.
+
+- Gradients and jvp verified against fp64 eager autograd (rel Frobenius < 1e-5), including gradients into snapshots, prefix, norm gain and projection (`tests/test_attn_res.py`, 9/9 passed).
+
+- 400-step Wan-Syn run with the kernel: loss trajectory IDENTICAL to the eager attention-residual run at every logged step (same seeds, numerically equivalent op).
+
+- Throughput/memory, matched probe harness (same session, idle GPU, 50 timed steps, micro-batch 4 x grad_accum 2 unless stated):
+
+| mode | samples/s | ms/step | peak memory |
+|---|---|---|---|
+| eager attn-res, accum | 6.56 | 1220 | 13.14 GiB |
+| Triton attn-res, accum | 7.28 | 1099 | 8.02 GiB |
+| Triton attn-res, batch 8 (no accum) | 8.63 | 927 | 12.05 GiB |
+
+- Batch 8 without accumulation OOMs on 16 GB with the eager op (it stores the RMS-normed stack, scores and probabilities in the autograd graph per apply) and fits with the Triton op (saves only the candidate stack and the fused direction): +32% throughput over the eager configuration that fits.
+
+- Absolute samples/s are not comparable across sessions on this desktop: concurrent CPU load from unrelated jobs (load average 13-16 during these probes) shifts the partly CPU-bound training loop; the earlier eager training run logged 10.6 samples/s at lower background load. Within-session A/B: Triton 7.3-7.4 vs eager 6.4-6.6 samples/s over 100 real `train.py` steps, GPU clocks pinned at 2790-2850 MHz (no thermal throttling).
