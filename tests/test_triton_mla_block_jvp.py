@@ -76,8 +76,9 @@ def block32():
     return make_block(dtype=torch.float32)
 
 
+@pytest.mark.parametrize("variant,tol", [("fp16", 3e-3), ("fp8", 4e-2)])
 @pytest.mark.parametrize("b,l", [(2, 512), (1, 210), (3, 384)])
-def test_matches_fp64_reference(block32, b, l):
+def test_matches_fp64_reference(block32, b, l, variant, tol):
     """Triton MLA block JVP vs fp64 eager reference (primal and tangent)."""
     torch.manual_seed(2)
     x = torch.randn(b, l, D, device="cuda")            # (b, l, d) primal
@@ -95,12 +96,12 @@ def test_matches_fp64_reference(block32, b, l):
 
     params = mla_params_from_block(block32)
     y, dy = triton_mla_block_jvp(x.contiguous(), dx.contiguous(), params,
-                                 cos, sin)
+                                 cos, sin, variant=variant)
     assert y.shape == (b, l, D) and dy.shape == (b, l, D)
     assert torch.isfinite(y).all() and torch.isfinite(dy).all()
-    # fp8 activations + fp16-accumulate attention: ~1e-2 rel Fro class
-    assert rel_err(y, y64) < 4e-2, f"primal rel err {rel_err(y, y64):.3e}"
-    assert rel_err(dy, dy64) < 4e-2, f"tangent rel err {rel_err(dy, dy64):.3e}"
+    # fp16 path: fp16-rounding-limited; fp8 path: ~1e-2 rel Fro class
+    assert rel_err(y, y64) < tol, f"primal rel err {rel_err(y, y64):.3e}"
+    assert rel_err(dy, dy64) < tol, f"tangent rel err {rel_err(dy, dy64):.3e}"
 
 
 def test_module_wrapper_matches_functional(block32):
@@ -135,8 +136,9 @@ def _bench(fn, iters=20, warmup=5):
     return times[len(times) // 2]
 
 
-def test_speedup_at_least_10x(block32):
-    """>= 10x vs pure-PyTorch eager fp32 jvp at (2, 2048, 1024).
+def test_speedup_at_least_10x_fp16(block32):
+    """fp16 variant (no fp8 anywhere) >= 10x vs pure-PyTorch eager fp32
+    jvp at (2, 2048, 1024).
 
     (2, 4096) is infeasible for the eager baseline on 16 GB: sdpa math
     materializes four (b, H, l, l) fp32 score/prob buffers under jvp.
@@ -148,30 +150,34 @@ def test_speedup_at_least_10x(block32):
     x = torch.randn(b, l, D, device="cuda")            # (b, l, d)
     dx = torch.randn(b, l, D, device="cuda")           # (b, l, d)
     cos, sin = make_rope(l)
-    mod = TritonMLABlockJVP(block32)
+    mod = TritonMLABlockJVP(block32, variant="fp16")
 
     t_triton = _bench(lambda: mod(x, dx, cos, sin))
     t_eager = _bench(lambda: eager_jvp(block32, x, dx, cos, sin), iters=10)
     speedup = t_eager / t_triton
-    print(f"\n(2, {l}, {D}): eager fp32 {t_eager:.2f} ms, "
+    print(f"\n(2, {l}, {D}) fp16: eager fp32 {t_eager:.2f} ms, "
           f"triton {t_triton:.3f} ms, speedup {speedup:.2f}x")
     assert speedup >= 10.0, f"only {speedup:.2f}x"
 
 
 if __name__ == "__main__":
     block = make_block(dtype=torch.float32)
-    mod = TritonMLABlockJVP(block)
     print(f"MLA block d={D} H={H} dq={DQ} dc={DC} dn={DN} dr={DR} dv={DV}")
+    mods = {v: TritonMLABlockJVP(block, variant=v) for v in ("fp16", "fp8")}
     for b, l in [(2, 2048), (2, 4096), (8, 210)]:
         torch.manual_seed(5)
         x = torch.randn(b, l, D, device="cuda")
         dx = torch.randn(b, l, D, device="cuda")
         cos, sin = make_rope(l)
-        t_tr = _bench(lambda: mod(x, dx, cos, sin), iters=30)
+        t = {v: _bench(lambda m=m: m(x, dx, cos, sin), iters=30)
+             for v, m in mods.items()}
         try:
             t_eg = _bench(lambda: eager_jvp(block, x, dx, cos, sin), iters=10)
-            note = f"eager fp32 {t_eg:8.2f} ms  speedup {t_eg / t_tr:6.2f}x"
+            note = (f"eager fp32 {t_eg:8.2f} ms  "
+                    f"fp16 {t_eg / t['fp16']:6.2f}x  "
+                    f"fp8 {t_eg / t['fp8']:6.2f}x")
         except torch.OutOfMemoryError:
             torch.cuda.empty_cache()
             note = "eager fp32 OOM"
-        print(f"({b}, {l:4d}, {D}): triton {t_tr:7.3f} ms   {note}")
+        print(f"({b}, {l:4d}, {D}): fp16 {t['fp16']:7.3f} ms  "
+              f"fp8 {t['fp8']:7.3f} ms   {note}")

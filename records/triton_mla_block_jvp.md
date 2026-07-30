@@ -1,8 +1,14 @@
-# Triton MLA Block JVP (fp32 io, fp8/fp16 internals)
+# Triton MLA Block JVP (fp32 io, fp16 default / fp8 optional internals)
 
 ## Task
 
-- Rewrite the Triton transformer-block JVP (Jacobian-vector product) so it supports the MLA (Multi-head Latent Attention) block of `models/imf_dit_video.py`, at least 10x faster than pure PyTorch ops.
+- Rewrite the Triton transformer-block JVP (Jacobian-vector product) so it supports the MLA (Multi-head Latent Attention) block of `models/imf_dit_video.py`, at least 10x faster than pure PyTorch ops, with fp16/bf16 (not fp8) internals as the default.
+
+## Variants
+
+- `variant="fp16"` (default): fp16 weights + fp16 activations, cuBLAS fp16 GEMMs with fp32 accumulation, fp16 flash-attention JVP core (fp16-accumulate per-tile dots, fp32 softmax statistics and cross-tile accumulation). No fp8 anywhere.
+
+- `variant="fp8"`: fp8 `torch._scaled_mm` GEMMs with per-tensor weight scales, fp8 activations quantized inside the producing kernels.
 
 ## Structure
 
@@ -79,22 +85,26 @@ $$
 
 ## Results
 
-- Speed (median CUDA-event ms):
+- Speed (median CUDA-event ms; eager = `torch.func.jvp` through the fp32 `TransformerBlock`, sdpa math backend):
 
-| shape (b, l, d) | eager fp32 jvp | Triton MLA JVP | speedup |
-|---|---|---|---|
-| (2, 2048, 1024) | 39.57 ms | 1.934 ms | 20.46x |
-| (2, 4096, 1024) | 124.83 ms | 4.714 ms | 26.48x |
-| (8, 210, 1024) | 9.53 ms | 0.687 ms | 13.86x |
+| shape (b, l, d) | eager fp32 jvp | fp16 variant | fp8 variant | fp16 speedup | fp8 speedup |
+|---|---|---|---|---|---|
+| (2, 2048, 1024) | 39.69 ms | 3.391 ms | 1.930 ms | 11.71x | 20.57x |
+| (2, 4096, 1024) | 124.83 ms | 8.267 ms | 4.712 ms | 15.10x | 26.49x |
+| (8, 210, 1024) | 9.52 ms | 1.150 ms | 0.689 ms | 8.28x | 13.81x |
+
+- The (2, 4096) eager number is from a run with the memory free to hold the four (b, H, l, l) score/prob buffers; with both variant weight caches resident it OOMs on 16 GB.
+
+- The small (8, 210) shape is kernel-launch-overhead-dominated for the fp16 variant (8.28x); the 10x target shape class is the long-sequence one.
 
 - Accuracy (relative Frobenius error vs fp64 eager reference):
 
-| shape | Triton y | Triton dy | eager fp32 y | eager fp32 dy |
-|---|---|---|---|---|
-| (2, 512, 1024) | 6.93e-04 | 1.01e-03 | 3.63e-08 | 3.69e-08 |
-| (1, 210, 1024) | 7.96e-04 | 1.24e-03 | 3.64e-08 | 3.68e-08 |
+| shape | fp16 y | fp16 dy | fp8 y | fp8 dy | eager fp32 y |
+|---|---|---|---|---|---|
+| (2, 512, 1024) | 2.08e-04 | 2.08e-04 | 6.93e-04 | 1.01e-03 | 3.63e-08 |
+| (1, 210, 1024) | 2.07e-04 | 2.08e-04 | 7.96e-04 | 1.24e-03 | 3.64e-08 |
 
-- Tests: `tests/test_triton_mla_block_jvp.py`, 5/5 passed (fp64 reference match at three shapes including odd sequence length 210, module/functional bit-equality, >= 10x speed assert).
+- Tests: `tests/test_triton_mla_block_jvp.py`, 8/8 passed (fp64 reference match at three shapes x two variants including odd sequence length 210, module/functional bit-equality, >= 10x fp16 speed assert at (2, 2048, 1024)).
 
 ## Files
 

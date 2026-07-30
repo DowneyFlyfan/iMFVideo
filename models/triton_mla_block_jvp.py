@@ -33,13 +33,16 @@ primal and tangent, so each linear runs as ONE GEMM (general matrix multiply)
 on the stacked batch. RoPE is linear in its input at fixed position, so the
 tangent gets the same rotation as the primal.
 
-fp32-io fast path (the only variant): all six linears run in fp8
-(float8_e4m3fn) tensor cores via torch._scaled_mm with per-tensor weight
-scales; activations are quantized to fp8 inside the producing Triton kernels
-(unit scale, clamped); the flash-attention JVP core is imported unchanged
-from triton_block_jvp (fp8 operands, fp16-accumulate dots, fp32 softmax
-statistics); the residual stream is fp16 with fp32 norm math in registers;
-both outputs are fp32.
+fp32 io, two variants selected by `variant`:
+  * "fp16" (default): fp16 weights + fp16 activations, cuBLAS fp16 GEMMs
+    (fp32 accumulation), the fp16 flash-attention JVP core (fp16 operands,
+    fp16-accumulate per-tile dots, fp32 softmax statistics and cross-tile
+    accumulation). No fp8 anywhere; error is fp16-rounding-limited.
+  * "fp8": all six linears in fp8 (float8_e4m3fn) tensor cores via
+    torch._scaled_mm with per-tensor weight scales; activations quantized
+    to fp8 inside the producing Triton kernels (unit scale, clamped).
+In both variants the residual stream is fp16 with fp32 norm math in
+registers, and both outputs are fp32.
 """
 
 import math
@@ -118,7 +121,8 @@ def _q_prep_kernel(QB, WQN, COS, SIN, OUT,
                    DN: tl.constexpr,     # nope band width dn
                    DR2: tl.constexpr,    # rope angle pairs dr // 2
                    HD: tl.constexpr,     # head dim dn + dr (= 64)
-                   BN: tl.constexpr):    # next_power_of_2(DN)
+                   BN: tl.constexpr,     # next_power_of_2(DN)
+                   CLAMP: tl.constexpr): # clamp outputs into the fp8 range
     pid = tl.program_id(0)             # token row in [0, B*S)
     h = tl.program_id(1)               # head index in [0, H)
     b = pid // S                       # batch index
@@ -138,8 +142,9 @@ def _q_prep_kernel(QB, WQN, COS, SIN, OUT,
     mxdx = tl.sum(xn * dn_, axis=0) / DN
     yn = w * xn * inv_r
     dyn = w * (dn_ * inv_r - xn * (mxdx * inv_r * inv_r * inv_r))
-    yn = tl.clamp(yn, -448.0, 448.0)
-    dyn = tl.clamp(dyn, -448.0, 448.0)
+    if CLAMP:
+        yn = tl.clamp(yn, -448.0, 448.0)
+        dyn = tl.clamp(dyn, -448.0, 448.0)
     tl.store(OUT + dst_p + cn, yn.to(OUT.dtype.element_ty), mask=nm)
     tl.store(OUT + dst_t + cn, dyn.to(OUT.dtype.element_ty), mask=nm)
 
@@ -153,10 +158,15 @@ def _q_prep_kernel(QB, WQN, COS, SIN, OUT,
     xi = tl.load(QB + src_p + im).to(tl.float32)
     dxr = tl.load(QB + src_t + re).to(tl.float32)
     dxi = tl.load(QB + src_t + im).to(tl.float32)
-    yr = tl.clamp(xr * c - xi * sn, -448.0, 448.0)
-    yi = tl.clamp(xr * sn + xi * c, -448.0, 448.0)
-    dyr = tl.clamp(dxr * c - dxi * sn, -448.0, 448.0)
-    dyi = tl.clamp(dxr * sn + dxi * c, -448.0, 448.0)
+    yr = xr * c - xi * sn
+    yi = xr * sn + xi * c
+    dyr = dxr * c - dxi * sn
+    dyi = dxr * sn + dxi * c
+    if CLAMP:
+        yr = tl.clamp(yr, -448.0, 448.0)
+        yi = tl.clamp(yi, -448.0, 448.0)
+        dyr = tl.clamp(dyr, -448.0, 448.0)
+        dyi = tl.clamp(dyi, -448.0, 448.0)
     tl.store(OUT + dst_p + re, yr.to(OUT.dtype.element_ty))
     tl.store(OUT + dst_p + im, yi.to(OUT.dtype.element_ty))
     tl.store(OUT + dst_t + re, dyr.to(OUT.dtype.element_ty))
@@ -182,7 +192,8 @@ def _kv_prep_kernel(KVB, KR, WKN, COS, SIN, OUTK, OUTV,
                     DV: tl.constexpr,     # value head dim dv (= 64)
                     HD: tl.constexpr,     # qk head dim dn + dr (= 64)
                     BN: tl.constexpr,     # next_power_of_2(DN)
-                    KVW: tl.constexpr):   # kv_b per-head width dn + dv
+                    KVW: tl.constexpr,    # kv_b per-head width dn + dv
+                    CLAMP: tl.constexpr): # clamp outputs into the fp8 range
     pid = tl.program_id(0)             # token row in [0, B*S)
     h = tl.program_id(1)               # head index in [0, H)
     b = pid // S
@@ -202,11 +213,11 @@ def _kv_prep_kernel(KVB, KR, WKN, COS, SIN, OUTK, OUTV,
     w = tl.load(WKN + cn, mask=nm, other=0.0).to(tl.float32)
     inv_r = 1.0 / tl.sqrt(tl.sum(xn * xn, axis=0) / DN + eps)
     mxdx = tl.sum(xn * dn_, axis=0) / DN
-    yn = tl.clamp(w * xn * inv_r, -448.0, 448.0)
-    dyn = tl.clamp(
-        w * (dn_ * inv_r - xn * (mxdx * inv_r * inv_r * inv_r)),
-        -448.0, 448.0,
-    )
+    yn = w * xn * inv_r
+    dyn = w * (dn_ * inv_r - xn * (mxdx * inv_r * inv_r * inv_r))
+    if CLAMP:
+        yn = tl.clamp(yn, -448.0, 448.0)
+        dyn = tl.clamp(dyn, -448.0, 448.0)
     tl.store(OUTK + dk_p + cn, yn.to(OUTK.dtype.element_ty), mask=nm)
     tl.store(OUTK + dk_t + cn, dyn.to(OUTK.dtype.element_ty), mask=nm)
 
@@ -220,23 +231,27 @@ def _kv_prep_kernel(KVB, KR, WKN, COS, SIN, OUTK, OUTV,
     dxi = tl.load(KR + (pid + half) * skr_row + 2 * i + 1).to(tl.float32)
     re = DN + 2 * i
     im = DN + 2 * i + 1
-    tl.store(OUTK + dk_p + re,
-             tl.clamp(xr * c - xi * sn, -448.0, 448.0).to(OUTK.dtype.element_ty))
-    tl.store(OUTK + dk_p + im,
-             tl.clamp(xr * sn + xi * c, -448.0, 448.0).to(OUTK.dtype.element_ty))
-    tl.store(OUTK + dk_t + re,
-             tl.clamp(dxr * c - dxi * sn, -448.0, 448.0).to(OUTK.dtype.element_ty))
-    tl.store(OUTK + dk_t + im,
-             tl.clamp(dxr * sn + dxi * c, -448.0, 448.0).to(OUTK.dtype.element_ty))
-
+    yr = xr * c - xi * sn
+    yi = xr * sn + xi * c
+    dyr = dxr * c - dxi * sn
+    dyi = dxr * sn + dxi * c
     # ---- v: straight copy of the dv band (JVP of a copy is a copy) ----
     cv = tl.arange(0, DV)              # (DV,) value channel index
     v = tl.load(KVB + src_p + DN + cv).to(tl.float32)
     dv_ = tl.load(KVB + src_t + DN + cv).to(tl.float32)
-    tl.store(OUTV + dv_p + cv,
-             tl.clamp(v, -448.0, 448.0).to(OUTV.dtype.element_ty))
-    tl.store(OUTV + dv_t + cv,
-             tl.clamp(dv_, -448.0, 448.0).to(OUTV.dtype.element_ty))
+    if CLAMP:
+        yr = tl.clamp(yr, -448.0, 448.0)
+        yi = tl.clamp(yi, -448.0, 448.0)
+        dyr = tl.clamp(dyr, -448.0, 448.0)
+        dyi = tl.clamp(dyi, -448.0, 448.0)
+        v = tl.clamp(v, -448.0, 448.0)
+        dv_ = tl.clamp(dv_, -448.0, 448.0)
+    tl.store(OUTK + dk_p + re, yr.to(OUTK.dtype.element_ty))
+    tl.store(OUTK + dk_p + im, yi.to(OUTK.dtype.element_ty))
+    tl.store(OUTK + dk_t + re, dyr.to(OUTK.dtype.element_ty))
+    tl.store(OUTK + dk_t + im, dyi.to(OUTK.dtype.element_ty))
+    tl.store(OUTV + dv_p + cv, v.to(OUTV.dtype.element_ty))
+    tl.store(OUTV + dv_t + cv, dv_.to(OUTV.dtype.element_ty))
 
 
 # --------------------------------------------------------------------------
@@ -299,10 +314,8 @@ def _pad_cols_16(w):
     return torch.cat([w, w.new_zeros(w.shape[0], k16 - k)], dim=1)
 
 
-def _mla_fp8_cache(p):
-    """Quantize all six GEMM weights to fp8 with per-tensor scales.
-
-    Weight shapes (all (out_features, in_features)):
+def _mla_fused_weights(p):
+    """Fuse/pad the six GEMM weights (fp32, (out_features, in_features)):
         w_a       (dq + dc + dr, d)  fused q_a_proj + kv_a_proj
         w_qb      (H * (dn+dr), dq)
         w_kvb     (H * (dn+dv), dc)
@@ -310,37 +323,52 @@ def _mla_fp8_cache(p):
         w_gate_up (2 * F, d)         F padded to a multiple of 16
         w_down    (d, F)
     """
-    w_a = torch.cat([p["w_qa"], p["w_kva"]], dim=0)
-    w_gu = torch.cat([_pad_rows_16(p["w_gate"]), _pad_rows_16(p["w_up"])], dim=0)
     return {
-        "w_a": _fp8_weight(w_a),
-        "w_qb": _fp8_weight(p["w_qb"]),
-        "w_kvb": _fp8_weight(p["w_kvb"]),
-        "w_out": _fp8_weight(p["w_out"]),
-        "w_gate_up": _fp8_weight(w_gu),
-        "w_down": _fp8_weight(_pad_cols_16(p["w_down"])),
+        "w_a": torch.cat([p["w_qa"], p["w_kva"]], dim=0),
+        "w_qb": p["w_qb"],
+        "w_kvb": p["w_kvb"],
+        "w_out": p["w_out"],
+        "w_gate_up": torch.cat(
+            [_pad_rows_16(p["w_gate"]), _pad_rows_16(p["w_up"])], dim=0
+        ),
+        "w_down": _pad_cols_16(p["w_down"]),
     }
 
 
-def triton_mla_block_jvp(x, dx, params, rope_cos, rope_sin, eps=1e-6):
+def _mla_fp8_cache(p):
+    """fp8-quantize the fused weights with per-tensor amax scales.
+    Values are (w8 (N, K) fp8, descale (1,) fp32) pairs."""
+    return {k: _fp8_weight(w) for k, w in _mla_fused_weights(p).items()}
+
+
+def _mla_fp16_cache(p):
+    """fp16 copies of the fused weights, each (N, K) fp16."""
+    return {k: w.detach().half() for k, w in _mla_fused_weights(p).items()}
+
+
+def triton_mla_block_jvp(x, dx, params, rope_cos, rope_sin, eps=1e-6,
+                         variant="fp16"):
     """Forward-mode JVP of the MLA transformer block w.r.t. the input only.
 
     Args:
         x, dx: (b, l, d) fp32 CUDA contiguous primal input and tangent.
-        params: dict with keys (shapes as in _mla_fp8_cache, plus)
+        params: dict with keys (shapes as in _mla_fused_weights, plus)
             w_norm1 (d,), w_qa (dq, d), w_kva (dc+dr, d), w_qa_ln (dq,),
             w_kva_ln (dc,), w_qb (H*(dn+dr), dq), w_kvb (H*(dn+dv), dc),
             w_qnorm (dn,), w_knorm (dn,), w_out (d, H*dv), g_attn (d,),
             w_norm2 (d,), w_gate (F0, d), w_up (F0, d), w_down (d, F0),
             g_mlp (d,), and ints H, dq, dc, dn, dr, dv.
-            Optional "_fp8": cached _mla_fp8_cache(params).
+            Optional "_fp8" / "_fp16": cached weight dicts.
         rope_cos, rope_sin: (l, dr // 2) fp32 rotary angle tables.
+        variant: "fp16" (default; fp16 weights/activations, cuBLAS fp16
+            GEMMs, no fp8 anywhere) or "fp8" (fp8 GEMMs + fp8 activations).
 
     Returns:
         (y, dy): each (b, l, d) fp32.
     """
     assert x.is_cuda and x.is_contiguous() and dx.is_contiguous()
     assert x.dtype == torch.float32
+    assert variant in ("fp16", "fp8")
     B, S, D = x.shape                      # b, l, d
     H = params["H"]
     dq, dc = params["dq"], params["dc"]
@@ -352,38 +380,53 @@ def triton_mla_block_jvp(x, dx, params, rope_cos, rope_sin, eps=1e-6):
     half = B * S                           # primal token rows
     M = 2 * half                           # stacked rows
 
-    fp8w = params.get("_fp8")
-    if fp8w is None:
-        fp8w = _mla_fp8_cache(params)
-    f = fp8w["w_gate_up"][0].shape[0] // 2  # padded SwiGLU width F
+    if variant == "fp8":
+        w = params.get("_fp8") or _mla_fp8_cache(params)
+        act_dt = _FP8                      # activation buffer dtype
+        f = w["w_gate_up"][0].shape[0] // 2  # padded SwiGLU width F
 
-    # ---- RMSNorm1 JVP: (b,l,d) fp32 -> stacked fp8 (2b,l,d) ----
-    xs8 = torch.empty(2 * B, S, D, device=dev, dtype=_FP8)
-    _rmsnorm_jvp_strided(x, dx, params["w_norm1"], xs8[:B], xs8[B:],
+        def mm(a2d, key):
+            # a2d (M, K) fp8 @ cached fp8 weight (N, K) -> (M, N) fp16
+            return _fp8_mm(a2d, w[key], torch.float16)
+    else:
+        w = params.get("_fp16") or _mla_fp16_cache(params)
+        act_dt = torch.float16
+        f = w["w_gate_up"].shape[0] // 2   # padded SwiGLU width F
+
+        def mm(a2d, key):
+            # a2d (M, K) fp16 @ fp16 weight (N, K) -> (M, N) fp16, cuBLAS
+            # fp16 tensor cores with fp32 accumulation
+            return a2d @ w[key].t()
+
+    clamp = variant == "fp8"               # fp8 range clamp in prep kernels
+
+    # ---- RMSNorm1 JVP: (b,l,d) fp32 -> stacked (2b,l,d) act_dt ----
+    xs = torch.empty(2 * B, S, D, device=dev, dtype=act_dt)
+    _rmsnorm_jvp_strided(x, dx, params["w_norm1"], xs[:B], xs[B:],
                          D, D, D, eps, half)
 
-    # ---- fused q_a + kv_a projection: one fp8 GEMM ----
+    # ---- fused q_a + kv_a projection: one stacked GEMM ----
     # a[m, j] = sum_k n1[m, k] * w_a[j, k]   (einsum "mk,jk->mj")
     # columns: [q_latent (dq) | kv_latent (dc) | k_rope (dr)]
     wa = dq + dc + dr                      # fused output width
-    a = _fp8_mm(xs8.view(M, D), fp8w["w_a"], torch.float16)   # (M, wa)
+    a = mm(xs.view(M, D), "w_a")           # (M, wa) fp16
 
-    # ---- latent RMSNorms (strided reads out of `a`, fp8 out) ----
-    q_lat8 = torch.empty(M, dq, device=dev, dtype=_FP8)
+    # ---- latent RMSNorms (strided reads out of `a`, act_dt out) ----
+    q_lat = torch.empty(M, dq, device=dev, dtype=act_dt)
     _rmsnorm_jvp_strided(a, a[half:], params["w_qa_ln"],
-                         q_lat8, q_lat8[half:], dq, wa, dq, eps, half)
-    kv_lat8 = torch.empty(M, dc, device=dev, dtype=_FP8)
+                         q_lat, q_lat[half:], dq, wa, dq, eps, half)
+    kv_lat = torch.empty(M, dc, device=dev, dtype=act_dt)
     _rmsnorm_jvp_strided(a[:, dq:], a[half:, dq:], params["w_kva_ln"],
-                         kv_lat8, kv_lat8[half:], dc, wa, dc, eps, half)
+                         kv_lat, kv_lat[half:], dc, wa, dc, eps, half)
 
-    # ---- up-projections: q_b and kv_b fp8 GEMMs ----
+    # ---- up-projections: q_b and kv_b stacked GEMMs ----
     # qb[m, j] = sum_k q_lat[m, k] * w_qb[j, k]      (einsum "mk,jk->mj")
     # kvb[m, j] = sum_k kv_lat[m, k] * w_kvb[j, k]   (einsum "mk,jk->mj")
-    qb = _fp8_mm(q_lat8, fp8w["w_qb"], torch.float16)     # (M, H*(dn+dr))
-    kvb = _fp8_mm(kv_lat8, fp8w["w_kvb"], torch.float16)  # (M, H*(dn+dv))
+    qb = mm(q_lat, "w_qb")                 # (M, H*(dn+dr)) fp16
+    kvb = mm(kv_lat, "w_kvb")              # (M, H*(dn+dv)) fp16
 
-    # ---- assemble packed fp8 q/k/v: (2b, l, 3, H, 64) ----
-    packed = torch.empty(2 * B, S, 3, H, hd, device=dev, dtype=_FP8)
+    # ---- assemble packed q/k/v: (2b, l, 3, H, 64) act_dt ----
+    packed = torch.empty(2 * B, S, 3, H, hd, device=dev, dtype=act_dt)
     so_b, so_s = packed.stride(0), packed.stride(1)
     qv = packed[:, :, 0]                  # (2b, l, H, 64) q slot view
     kv_ = packed[:, :, 1]                 # (2b, l, H, 64) k slot view
@@ -392,45 +435,43 @@ def triton_mla_block_jvp(x, dx, params, rope_cos, rope_sin, eps=1e-6):
     _q_prep_kernel[(half, H)](
         qb, params["w_qnorm"], rope_cos, rope_sin, qv,
         H * hd, so_b, so_s, B, S, half, eps,
-        DN=dn, DR2=dr // 2, HD=hd, BN=BN, num_warps=1,
+        DN=dn, DR2=dr // 2, HD=hd, BN=BN, CLAMP=clamp, num_warps=1,
     )
     _kv_prep_kernel[(half, H)](
         kvb, a[:, dq + dc:], params["w_knorm"], rope_cos, rope_sin, kv_, vv,
         H * (dn + dv), wa, so_b, so_s, B, S, half, eps,
-        DN=dn, DR2=dr // 2, DV=dv, HD=hd, BN=BN, KVW=dn + dv, num_warps=1,
+        DN=dn, DR2=dr // 2, DV=dv, HD=hd, BN=BN, KVW=dn + dv, CLAMP=clamp,
+        num_warps=1,
     )
 
-    # ---- fused flash-attention JVP (fp8 io, fp32 softmax statistics) ----
+    # ---- fused flash-attention JVP (fp16/fp8 io, fp32 softmax stats) ----
     # o[m, h, :] = softmax_s(q[m,h,:] . k[s,h,:] * scale) @ v[s,h,:]
-    attn8 = torch.empty(2 * B, S, H * dv, device=dev, dtype=_FP8)
+    attn = torch.empty(2 * B, S, H * dv, device=dev, dtype=act_dt)
     _flash_jvp(qv[:B], kv_[:B], vv[:B], qv[B:], kv_[B:], vv[B:],
-               attn8[:B].view(B, S, H, dv),
-               attn8[B:].view(B, S, H, dv), scale)
+               attn[:B].view(B, S, H, dv),
+               attn[B:].view(B, S, H, dv), scale)
 
     # ---- out projection + gated residual + RMSNorm2 (fused kernel) ----
     # proj[m, j] = sum_k attn[m, k] * w_out[j, k]    (einsum "mk,jk->mj")
-    proj = _fp8_mm(attn8.view(M, H * dv), fp8w["w_out"],
-                   torch.float16).view(2 * B, S, D)
+    proj = mm(attn.view(M, H * dv), "w_out").view(2 * B, S, D)
     res = torch.empty(2 * B, S, D, device=dev, dtype=torch.float16)
     BLOCK = triton.next_power_of_2(D)
     _res_gate_norm_jvp_kernel[(half,)](
         proj[:B], proj[B:], params["g_attn"], x, dx, params["w_norm2"],
-        res[:B], res[B:], xs8[:B], xs8[B:], D, eps,
+        res[:B], res[B:], xs[:B], xs[B:], D, eps,
         BLOCK=BLOCK, num_warps=4 if BLOCK <= 1024 else 8,
-        CLAMP=True,
+        CLAMP=clamp,
     )
 
     # ---- gate/up projection + fused SwiGLU JVP ----
     # gu[m, j] = sum_k n2[m, k] * w_gate_up[j, k]    (einsum "mk,jk->mj")
-    gu = _fp8_mm(xs8.view(M, D), fp8w["w_gate_up"],
-                 torch.float16).view(2 * B, S, 2 * f)
-    act8 = torch.empty(2 * B, S, f, device=dev, dtype=_FP8)
-    _swiglu_jvp(gu[:B], gu[B:], act8[:B], act8[B:])
+    gu = mm(xs.view(M, D), "w_gate_up").view(2 * B, S, 2 * f)
+    act = torch.empty(2 * B, S, f, device=dev, dtype=act_dt)
+    _swiglu_jvp(gu[:B], gu[B:], act[:B], act[B:])
 
     # ---- down projection + gated final residual add (fp32 out) ----
     # dwn[m, j] = sum_k act[m, k] * w_down[j, k]     (einsum "mk,jk->mj")
-    dwn = _fp8_mm(act8.view(M, f), fp8w["w_down"],
-                  torch.float16).view(2 * B, S, D)
+    dwn = mm(act.view(M, f), "w_down").view(2 * B, S, D)
     g_mlp = params["g_mlp"]               # (d,) fp32 vector gate
     y = res[:B] + dwn[:B] * g_mlp         # (b, l, d) fp32 (promotion)
     dy = res[B:] + dwn[B:] * g_mlp        # (b, l, d) fp32
@@ -478,17 +519,23 @@ class TritonMLABlockJVP(nn.Module):
     """Module wrapper around triton_mla_block_jvp.
 
     Holds the parameter dict extracted from a TransformerBlock and caches
-    the fp8-quantized weights across calls. forward(x, dx, cos, sin) ->
-    (y, dy); x/dx (b, l, d) fp32, cos/sin (l, dr//2) fp32.
+    the fused fp16 (default) or fp8 weights across calls.
+    forward(x, dx, cos, sin) -> (y, dy); x/dx (b, l, d) fp32,
+    cos/sin (l, dr//2) fp32.
     """
 
-    def __init__(self, block, eps=1e-6):
+    def __init__(self, block, eps=1e-6, variant="fp16"):
         super().__init__()
         self.eps = eps
+        self.variant = variant
         self.params = mla_params_from_block(block)
-        self.params["_fp8"] = _mla_fp8_cache(self.params)
+        if variant == "fp8":
+            self.params["_fp8"] = _mla_fp8_cache(self.params)
+        else:
+            self.params["_fp16"] = _mla_fp16_cache(self.params)
 
     def forward(self, x, dx, rope_cos, rope_sin):
         return triton_mla_block_jvp(
-            x, dx, self.params, rope_cos, rope_sin, eps=self.eps
+            x, dx, self.params, rope_cos, rope_sin, eps=self.eps,
+            variant=self.variant,
         )
