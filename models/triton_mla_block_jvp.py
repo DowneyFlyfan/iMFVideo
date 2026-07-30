@@ -423,16 +423,19 @@ def _kv_prep_kernel(KVB, KR, WKN, COS, SIN, OUTK, OUTV,
 
 
 # --------------------------------------------------------------------------
-# Row-based SwiGLU JVP:  h = silu(g)*u,  dh = silu'(g)*dg*u + silu(g)*du,
-# silu'(g) = sigmoid(g)*(1 + g*(1 - sigmoid(g))).
+# Row-based SituAndMul JVP (Kimi-K3 bounded-SiLU gate):
+#   a(g)  = beta * tanh(g/beta) * sigmoid(g)
+#   a'(g) = sech^2(g/beta) * sigmoid(g)
+#           + beta * tanh(g/beta) * sigmoid(g) * (1 - sigmoid(g))
+#   h = a(g)*u,  dh = a'(g)*dg*u + a(g)*du
 # GU rows are [gate | up] of width 2F; one program per (row, F-chunk) with
 # plain vector loads (no per-element div/mod as in the flat kernel).
 # --------------------------------------------------------------------------
 @triton.jit
-def _swiglu_row_jvp_kernel(GU, DGU, Hout, DHout, F, BLOCK: tl.constexpr,
-                           CLAMP: tl.constexpr):
+def _swiglu_row_jvp_kernel(GU, DGU, Hout, DHout, F, beta,
+                           BLOCK: tl.constexpr, CLAMP: tl.constexpr):
     # GU/DGU: primal/tangent rows of width 2F ([gate | up]); Hout/DHout:
-    # output rows of width F
+    # output rows of width F;  beta: SituAndMul gate cap
     row = tl.program_id(0)             # token row index
     cb = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)   # (BLOCK,) col
     mask = cb < F
@@ -442,10 +445,12 @@ def _swiglu_row_jvp_kernel(GU, DGU, Hout, DHout, F, BLOCK: tl.constexpr,
     dg = tl.load(DGU + base, mask=mask, other=0.0).to(tl.float32)
     du = tl.load(DGU + base + F, mask=mask, other=0.0).to(tl.float32)
     sig = tl.sigmoid(g)
-    silu = g * sig
-    dsilu = sig * (1.0 + g * (1.0 - sig))
-    h = silu * u
-    dh = dsilu * dg * u + silu * du
+    # tanh(x) = 2*sigmoid(2x) - 1 (tl.math.tanh unavailable in this Triton)
+    th = 2.0 * tl.sigmoid(2.0 * g / beta) - 1.0
+    act = beta * th * sig                        # a(g)
+    dact = (1.0 - th * th) * sig + beta * th * sig * (1.0 - sig)   # a'(g)
+    h = act * u
+    dh = dact * dg * u + act * du
     if CLAMP:
         h = tl.clamp(h, -448.0, 448.0)
         dh = tl.clamp(dh, -448.0, 448.0)
@@ -454,11 +459,11 @@ def _swiglu_row_jvp_kernel(GU, DGU, Hout, DHout, F, BLOCK: tl.constexpr,
     tl.store(DHout + op, dh.to(DHout.dtype.element_ty), mask=mask)
 
 
-def _swiglu_row_jvp(gu, dgu, h, dh, n_rows, f):
+def _swiglu_row_jvp(gu, dgu, h, dh, n_rows, f, beta=1.0):
     # gu/dgu: (n_rows, 2F) fp16 primal/tangent; h/dh: (n_rows, F) outputs
     BLOCK = 1024
     _swiglu_row_jvp_kernel[(n_rows, triton.cdiv(f, BLOCK))](
-        gu, dgu, h, dh, f, BLOCK=BLOCK, num_warps=4,
+        gu, dgu, h, dh, f, beta, BLOCK=BLOCK, num_warps=4,
         CLAMP=(h.dtype == _FP8),
     )
 
@@ -736,7 +741,8 @@ def _mla_chunk(x, dx, params, rope_cos, rope_sin, eps, variant, out_y, out_dy):
     # gu[m, j] = sum_k n2[m, k] * w_gate_up[j, k]    (einsum "mk,jk->mj")
     gu = mm(xs.view(M, D), "w_gate_up").view(2 * B, S, 2 * f)
     act = torch.empty(2 * B, S, f, device=dev, dtype=act_dt)
-    _swiglu_row_jvp(gu[:B], gu[B:], act[:B], act[B:], half, f)
+    _swiglu_row_jvp(gu[:B], gu[B:], act[:B], act[B:], half, f,
+                    beta=params.get("situ_beta", 1.0))
 
     # ---- down projection with fused gated final residual add (fp32 out) ----
     # dwn[m, j] = sum_k act[m, k] * w_down[j, k]     (einsum "mk,jk->mj")
@@ -780,6 +786,7 @@ def mla_params_from_block(block):
         "w_up": block.mlp.w3.weight.detach(),          # (F0, d)
         "w_down": block.mlp.w2.weight.detach(),        # (d, F0)
         "g_mlp": block.mlp_scale.detach(),             # (d,)
+        "situ_beta": getattr(getattr(block.mlp, "act", None), "beta", 1.0),
         "H": attn.num_heads,
         "dq": attn.q_lora_rank,
         "dc": attn.kv_lora_rank,
