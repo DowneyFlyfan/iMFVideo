@@ -1,4 +1,4 @@
-"""PyTorch video imfDiT: port of models/imfDiT.py (JAX/Flax) extended from
+"""PyTorch video imfDiT: port of refs/imfDiT.py (JAX/Flax) extended from
 images to video latents.
 
 Input latents: (B, C, T, H, W) with C = 16 (Wan2.1 VAE latent channels).
@@ -15,10 +15,40 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 #################################################################################
 #                          Pluggable Attention Kernels                           #
 #################################################################################
+
+
+def eager_math_attention(q, k, v):
+    """Attention written out as einsums, softmax accumulated in float32.
+
+    Shape symbols
+        b  : batch size
+        l  : query sequence length
+        s  : key/value sequence length (equal to l for self-attention)
+        H  : number of heads
+        dk : query/key head dim
+        dv : value head dim (may differ from dk, as it does under MLA)
+
+    Every op here (matmul, softmax, mul) has a forward-mode AD formula on all
+    backends, which the fused and MPS-specific SDPA kernels do not. Softmax
+    scale is 1/sqrt(dk), matching F.scaled_dot_product_attention's default.
+
+    Args:
+        q: (b, l, H, dk)
+        k: (b, s, H, dk)
+        v: (b, s, H, dv)
+
+    Returns:
+        (b, l, H, dv)
+    """
+    scale = 1.0 / math.sqrt(q.shape[-1])
+    scores = torch.einsum("blhd,bshd->bhls", q.float(), k.float()) * scale
+    #   scores: (b, H, l, s) attention logits
+    probs = torch.softmax(scores, dim=-1)  # (b, H, l, s)
+    out = torch.einsum("bhls,bshd->blhd", probs, v.float())  # (b, l, H, dv)
+    return out.to(v.dtype)
 
 
 def sdpa_math_attention(q, k, v):
@@ -29,12 +59,19 @@ def sdpa_math_attention(q, k, v):
     mem-efficient kernels do not; a CuTeDSL flash-attention JVP op can be
     plugged in later via the `attn_impl` constructor argument.
 
+    On MPS (Apple Metal), SDPA dispatches to
+    aten::_scaled_dot_product_attention_math_for_mps, which has no forward-AD
+    formula and raises under torch.func.jvp, so the einsum path is used there.
+
     Args:
-        q, k, v: (batch, seq_len, num_heads, head_dim)
+        q, k, v: (batch, seq_len, num_heads, head_dim); v may carry a different
+            head dim than q/k (MLA uses v_head_dim != qk_head_dim).
 
     Returns:
-        (batch, seq_len, num_heads, head_dim)
+        (batch, seq_len, num_heads, v_head_dim)
     """
+    if q.device.type == "mps":
+        return eager_math_attention(q, k, v)
     q, k, v = (x.transpose(1, 2) for x in (q, k, v))  # -> (B, H, S, D)
     with torch.nn.attention.sdpa_kernel([torch.nn.attention.SDPBackend.MATH]):
         out = F.scaled_dot_product_attention(q, k, v)
@@ -111,7 +148,9 @@ class TimestepEmbedder(nn.Module):
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+            embedding = torch.cat(
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
+            )
         return embedding
 
     def forward(self, t):
@@ -151,8 +190,6 @@ class VideoPatchEmbedder(nn.Module):
             nn.init.zeros_(self.proj.bias)
 
     def forward(self, x):
-        # x: (B, C, T, H, W) -> (B, hidden, T', H', W') -> (B, N, hidden)
-        # Token order: t-major, then h, then w.
         x = self.proj(x)
         return x.flatten(2).transpose(1, 2)
 
@@ -183,60 +220,192 @@ def apply_rotary_pos_emb(x, rope_cos, rope_sin):
     return out.to(x.dtype)
 
 
-class RoPEAttention(nn.Module):
-    """Multi-head self-attention with RoPE, QK RMS norm, pluggable kernel."""
+def attn_res_apply(prefix, snaps, gain, proj_w, eps=1e-6):
+    """Kimi-K3-style attention residual (modeling_kimi_linear._apply_attn_res).
 
-    def __init__(self, hidden_size, num_heads, weight_init_constant=1.0,
-                 attn_impl=sdpa_math_attention):
+    Per token, a 1-query softmax attention over the token's own residual-
+    stream history: J = len(snaps) + 1 candidate vectors (earlier block
+    snapshots + the current prefix sum) are RMS-normalized, scored against a
+    single learned direction (norm gain folded with the 1-dim projection),
+    and mixed by softmax.
+
+    Args:
+        prefix: (b, l, d) current residual prefix sum.
+        snaps: list of (b, l, d) block snapshots (may be empty).
+        gain: (d,) RMSNorm gain of the residual-attention norm.
+        proj_w: (1, d) or (d,) weight of the Linear(d, 1) score projection.
+        eps: RMSNorm epsilon.
+
+    Returns:
+        (b, l, d) re-mixed residual stream, in prefix.dtype.
+    """
+    v = torch.stack(list(snaps) + [prefix], dim=2)      # (b, l, J, d)
+    vf = v.float()
+    var = vf.pow(2).mean(-1, keepdim=True)              # (b, l, J, 1)
+    k = vf * torch.rsqrt(var + eps)                     # (b, l, J, d) RMS-normed
+    w = gain.float() * proj_w.reshape(-1).float()       # (d,) fused score dir
+    scores = torch.einsum("bljd,d->blj", k, w)          # (b, l, J)
+    probs = scores.softmax(-1)                          # (b, l, J)
+    out = torch.einsum("blj,bljd->bld", probs, vf)      # (b, l, d)
+    return out.to(prefix.dtype)
+
+
+class MLAAttention(nn.Module):
+    """Multi-head Latent Attention (MLA) with decoupled ("partial") RoPE.
+
+    Shape symbols used throughout this class:
+        b  : batch size
+        l  : sequence length (num_prefix_tokens + num_patch_tokens)
+        d  : hidden_size, model width
+        H  : num_heads (query heads; MLA gives every query head its own
+             up-projected key/value, so there is no grouped-query sharing)
+        dq : q_lora_rank, query down-projection (latent) dim
+        dc : kv_lora_rank, shared key/value down-projection (latent) dim
+        dn : qk_nope_head_dim, position-free part of each q/k head vector
+        dr : qk_rope_head_dim, rotary part of each q/k head vector; the key
+             half is ONE shared head broadcast over all H query heads
+        dv : v_head_dim, value head dim
+
+    Why MLA in a DiT. A diffusion transformer runs one bidirectional forward
+    pass per denoising step and keeps no KV cache, so MLA's usual selling point
+    (cache compression for autoregressive decoding) does not apply. What it
+    does buy here is a low-rank bottleneck on the q/k/v projections: with the
+    defaults below the attention block holds ~0.68x the parameters of the
+    equivalent full-rank multi-head attention, and the shared dc-dim latent
+    constrains keys and values to a common subspace.
+
+    Decoupled / partial RoPE. Only the trailing dr channels of each q/k head
+    vector carry rotary phase; the leading dn channels are position-free and
+    come straight from the compressed latent. The key side of the rotary band
+    (k_rope) is computed once per token from x and shared across all H heads,
+    which is what makes the band "decoupled" from the low-rank path.
+    """
+
+    def __init__(
+        self,
+        hidden_size,
+        num_heads,
+        q_lora_rank,
+        kv_lora_rank,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        v_head_dim,
+        weight_init_constant=1.0,
+        norm_eps=1e-6,
+        attn_impl=sdpa_math_attention,
+    ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.v_head_dim = v_head_dim
         self.attn_impl = attn_impl
 
         linear = partial(
             scaled_variance_linear, bias=False, init_constant=weight_init_constant
         )
-        self.q_proj = linear(hidden_size, hidden_size)
-        self.k_proj = linear(hidden_size, hidden_size)
-        self.v_proj = linear(hidden_size, hidden_size)
-        self.out_proj = linear(hidden_size, hidden_size)
+        # query: d -> dq -> H * (dn + dr)
+        self.q_a_proj = linear(hidden_size, q_lora_rank)
+        self.q_b_proj = linear(q_lora_rank, num_heads * self.qk_head_dim)
+        # key/value: d -> (dc latent | dr shared rotary key), then dc -> H * (dn + dv)
+        self.kv_a_proj = linear(hidden_size, kv_lora_rank + qk_rope_head_dim)
+        self.kv_b_proj = linear(
+            kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim)
+        )
+        self.out_proj = linear(num_heads * v_head_dim, hidden_size)
 
-        self.q_norm = RMSNorm(self.head_dim)
-        self.k_norm = RMSNorm(self.head_dim)
+        # Latent-space norms (DeepSeek-V2/V3 placement).
+        self.q_a_layernorm = RMSNorm(q_lora_rank, eps=norm_eps)
+        self.kv_a_layernorm = RMSNorm(kv_lora_rank, eps=norm_eps)
+        # Per-head QK norm on the position-free band only. The rotary band is
+        # left un-normed so that k_rope stays a single shared head; it is
+        # bounded upstream by q_a_layernorm (query side) and by the small
+        # kv_a_proj init scale (key side).
+        self.q_norm = RMSNorm(qk_nope_head_dim, eps=norm_eps)
+        self.k_norm = RMSNorm(qk_nope_head_dim, eps=norm_eps)
 
     def forward(self, x, rope_cos, rope_sin):
-        batch, seq_len, _ = x.shape
-        q = self.q_proj(x).reshape(batch, seq_len, self.num_heads, self.head_dim)
-        k = self.k_proj(x).reshape(batch, seq_len, self.num_heads, self.head_dim)
-        v = self.v_proj(x).reshape(batch, seq_len, self.num_heads, self.head_dim)
+        """
+        Args:
+            x: (b, l, d) input token features.
+            rope_cos, rope_sin: (l, dr // 2) precomputed rotary angles, float32.
 
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        Returns:
+            (b, l, d) attention output.
+        """
+        b, l, _ = x.shape
+        H = self.num_heads
+        dn, dr, dv = self.qk_nope_head_dim, self.qk_rope_head_dim, self.v_head_dim
 
-        q = apply_rotary_pos_emb(q, rope_cos, rope_sin)
-        k = apply_rotary_pos_emb(k, rope_cos, rope_sin)
+        # ---- query path: (b,l,d) -> latent (b,l,dq) -> heads (b,l,H,dn+dr) ----
+        q_latent = self.q_a_layernorm(self.q_a_proj(x))  # (b, l, dq)
+        q = self.q_b_proj(q_latent).reshape(b, l, H, dn + dr)  # (b, l, H, dn+dr)
+        q_nope, q_rope = q.split([dn, dr], dim=-1)  # (b,l,H,dn), (b,l,H,dr)
 
-        attn = self.attn_impl(q, k, v)
-        attn = attn.reshape(batch, seq_len, self.hidden_size)
+        # ---- key/value path: (b,l,d) -> (b,l,dc) latent + (b,l,dr) shared key ----
+        kv_a = self.kv_a_proj(x)  # (b, l, dc+dr)
+        kv_latent, k_rope = kv_a.split([self.kv_lora_rank, dr], dim=-1)
+        #   kv_latent: (b, l, dc)      k_rope: (b, l, dr)  <- shared over heads
+        kv_latent = self.kv_a_layernorm(kv_latent)  # (b, l, dc)
+        kv = self.kv_b_proj(kv_latent).reshape(b, l, H, dn + dv)  # (b, l, H, dn+dv)
+        k_nope, v = kv.split([dn, dv], dim=-1)  # (b,l,H,dn), (b,l,H,dv)
 
-        return self.out_proj(attn)
+        q_nope = self.q_norm(q_nope)  # (b, l, H, dn)
+        k_nope = self.k_norm(k_nope)  # (b, l, H, dn)
+
+        # ---- partial RoPE: rotate only the trailing dr channels ----
+        q_rope = apply_rotary_pos_emb(q_rope, rope_cos, rope_sin)  # (b, l, H, dr)
+        k_rope = apply_rotary_pos_emb(
+            k_rope.unsqueeze(2), rope_cos, rope_sin
+        )  # (b, l, 1, dr)
+        k_rope = k_rope.expand(b, l, H, dr)  # (b, l, H, dr)
+
+        q = torch.cat([q_nope, q_rope], dim=-1)  # (b, l, H, dn+dr)
+        k = torch.cat([k_nope, k_rope], dim=-1)  # (b, l, H, dn+dr)
+
+        # attn_impl leaves softmax_scale at its default 1/sqrt(q.shape[-1]),
+        # which for MLA is 1/sqrt(dn + dr) -- the full query head dim.
+        attn = self.attn_impl(q, k, v)  # (b, l, H, dv)
+        return self.out_proj(attn.reshape(b, l, H * dv))  # (b, l, d)
 
 
 class TransformerBlock(nn.Module):
     """Transformer block with zero-initialized vector gates on residuals."""
 
-    def __init__(self, hidden_size, num_heads, mlp_ratio=8 / 3,
-                 weight_init_constant=1.0, attn_impl=sdpa_math_attention):
+    def __init__(
+        self,
+        hidden_size,
+        num_heads,
+        q_lora_rank,
+        kv_lora_rank,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        v_head_dim,
+        mlp_ratio=8 / 3,
+        weight_init_constant=1.0,
+        norm_eps=1e-6,
+        attn_impl=sdpa_math_attention,
+        use_attn_res=False,
+    ):
         super().__init__()
-        self.norm1 = RMSNorm(hidden_size)
-        self.attn = RoPEAttention(
+        self.norm1 = RMSNorm(hidden_size, eps=norm_eps)
+        self.attn = MLAAttention(
             hidden_size,
             num_heads=num_heads,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
             weight_init_constant=weight_init_constant,
+            norm_eps=norm_eps,
             attn_impl=attn_impl,
         )
-        self.norm2 = RMSNorm(hidden_size)
+        self.norm2 = RMSNorm(hidden_size, eps=norm_eps)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp = SwiGLUMlp(
             hidden_size, mlp_hidden_dim, weight_init_constant=weight_init_constant
@@ -244,6 +413,19 @@ class TransformerBlock(nn.Module):
 
         self.attn_scale = nn.Parameter(torch.zeros(hidden_size))
         self.mlp_scale = nn.Parameter(torch.zeros(hidden_size))
+
+        # Kimi-K3 attention-residual heads (used only when the parent model
+        # runs with attn_res_block_size > 0): an RMSNorm + Linear(d, 1) pair
+        # per sublayer scores the residual-stream snapshots.
+        if use_attn_res:
+            self.attn_res_norm = RMSNorm(hidden_size, eps=norm_eps)
+            self.mlp_res_norm = RMSNorm(hidden_size, eps=norm_eps)
+            self.attn_res_proj = scaled_variance_linear(
+                hidden_size, 1, bias=False, init_constant=weight_init_constant
+            )
+            self.mlp_res_proj = scaled_variance_linear(
+                hidden_size, 1, bias=False, init_constant=weight_init_constant
+            )
 
     def forward(self, x, rope_cos, rope_sin):
         x = x + self.attn(self.norm1(x), rope_cos, rope_sin) * self.attn_scale
@@ -254,10 +436,10 @@ class TransformerBlock(nn.Module):
 class FinalLayer(nn.Module):
     """Final projection layer with RMSNorm and zero-init weights."""
 
-    def __init__(self, hidden_size, patch_size, out_channels):
+    def __init__(self, hidden_size, patch_size, out_channels, norm_eps=1e-6):
         super().__init__()
         patch_t, patch_h, patch_w = patch_size
-        self.norm = RMSNorm(hidden_size)
+        self.norm = RMSNorm(hidden_size, eps=norm_eps)
         self.linear = nn.Linear(
             hidden_size, patch_t * patch_h * patch_w * out_channels, bias=True
         )
@@ -345,19 +527,63 @@ class IMFDiTVideo(nn.Module):
         mlp_ratio=8 / 3,
         num_classes=1000,
         aux_head_depth=8,
+        # --- MLA (multi-head latent attention) geometry; 0 = derive from head_dim ---
+        q_lora_rank=0,
+        kv_lora_rank=0,
+        qk_nope_head_dim=0,
+        qk_rope_head_dim=0,
+        v_head_dim=0,
         num_class_tokens=8,
         num_time_tokens=4,
         num_cfg_tokens=4,
         num_interval_tokens=2,
+        freq_embedding_size=256,
         token_init_constant=1.0,
         embedding_init_constant=1.0,
         weight_init_constant=0.32,
+        rmsnorm_eps=1e-6,
+        rope_theta=10000.0,
         attn_impl=sdpa_math_attention,
         eval_mode=False,
+        attn_res_block_size=0,
     ):
         super().__init__()
         self.head_dim = hidden_size // num_heads
-        assert self.head_dim == 64, "head_dim must be 64 for the flash-attn JVP op"
+        # Kimi-K3 attention residual: snapshot the residual stream every
+        # attn_res_block_size blocks; 0 disables the mechanism entirely.
+        self.attn_res_block_size = attn_res_block_size
+
+        # MLA defaults, all derived from head_dim so that
+        #   qk_nope_head_dim + qk_rope_head_dim == v_head_dim == head_dim,
+        # which keeps the layout drop-in compatible with the fixed-head_dim-64
+        # flash JVP op while still giving the low-rank q/kv bottleneck.
+        self.v_head_dim = v_head_dim or self.head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim or max(2, self.head_dim // 4)
+        self.qk_nope_head_dim = (
+            qk_nope_head_dim or self.head_dim - self.qk_rope_head_dim
+        )
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        # Latent ranks must scale with hidden_size, not head_dim: a rank larger
+        # than the dim it compresses makes the "bottleneck" cost more than the
+        # full-rank projection it replaces. d/2 and d/4 keep the attention block
+        # at ~0.69x the parameters of equivalent full-rank multi-head attention.
+        self.q_lora_rank = q_lora_rank or max(self.head_dim, hidden_size // 2)
+        self.kv_lora_rank = kv_lora_rank or max(self.head_dim, hidden_size // 4)
+
+        # apply_rotary_pos_emb pairs adjacent channels, and precompute_axial_rope_3d
+        # splits the rotary band across the (t, h, w) axes; both need even dims.
+        assert self.qk_rope_head_dim % 2 == 0, "qk_rope_head_dim must be even"
+        assert self.qk_nope_head_dim % 2 == 0, (
+            "qk_nope_head_dim must be even so the rotary band starts on an even "
+            "channel offset"
+        )
+        if getattr(attn_impl, "__name__", "") == "flash_jvp_attention":
+            assert self.qk_head_dim == 64 and self.v_head_dim == 64, (
+                "flash_jvp_attention is compiled for head_dim 64: need "
+                "qk_nope_head_dim + qk_rope_head_dim == v_head_dim == 64, got "
+                f"{self.qk_nope_head_dim} + {self.qk_rope_head_dim} and "
+                f"{self.v_head_dim}"
+            )
 
         self.patch_size = patch_size
         self.in_channels = in_channels
@@ -377,14 +603,21 @@ class IMFDiTVideo(nn.Module):
             in_channels, hidden_size, patch_size=patch_size, bias=True
         )
 
-        embed_kwargs = dict(
-            hidden_size=hidden_size, init_constant=embedding_init_constant
+        # TimestepEmbedder takes the sinusoidal basis width; LabelEmbedder does not.
+        time_embed_kwargs = dict(
+            hidden_size=hidden_size,
+            frequency_embedding_size=freq_embedding_size,
+            init_constant=embedding_init_constant,
         )
-        self.h_embedder = TimestepEmbedder(**embed_kwargs)
-        self.omega_embedder = TimestepEmbedder(**embed_kwargs)
-        self.cfg_t_start_embedder = TimestepEmbedder(**embed_kwargs)
-        self.cfg_t_end_embedder = TimestepEmbedder(**embed_kwargs)
-        self.y_embedder = LabelEmbedder(num_classes, **embed_kwargs)
+        self.h_embedder = TimestepEmbedder(**time_embed_kwargs)
+        self.omega_embedder = TimestepEmbedder(**time_embed_kwargs)
+        self.cfg_t_start_embedder = TimestepEmbedder(**time_embed_kwargs)
+        self.cfg_t_end_embedder = TimestepEmbedder(**time_embed_kwargs)
+        self.y_embedder = LabelEmbedder(
+            num_classes,
+            hidden_size=hidden_size,
+            init_constant=embedding_init_constant,
+        )
 
         token_std = token_init_constant / math.sqrt(hidden_size)
         self.time_tokens = nn.Parameter(
@@ -410,8 +643,13 @@ class IMFDiTVideo(nn.Module):
             + num_time_tokens
         )
 
+        # Partial RoPE: the table covers only the rotary band (dr channels),
+        # not the whole head vector.
         rope_cos, rope_sin = precompute_axial_rope_3d(
-            self.head_dim, self.grid_size, self.prefix_tokens
+            self.qk_rope_head_dim,
+            self.grid_size,
+            self.prefix_tokens,
+            theta=rope_theta,
         )
         self.register_buffer("rope_cos", rope_cos, persistent=False)
         self.register_buffer("rope_sin", rope_sin, persistent=False)
@@ -422,9 +660,16 @@ class IMFDiTVideo(nn.Module):
         block_kwargs = dict(
             hidden_size=hidden_size,
             num_heads=num_heads,
+            q_lora_rank=self.q_lora_rank,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            v_head_dim=self.v_head_dim,
             mlp_ratio=mlp_ratio,
             weight_init_constant=weight_init_constant,
+            norm_eps=rmsnorm_eps,
             attn_impl=attn_impl,
+            use_attn_res=attn_res_block_size > 0,
         )
         self.shared_blocks = nn.ModuleList(
             [TransformerBlock(**block_kwargs) for _ in range(shared_depth)]
@@ -440,8 +685,26 @@ class IMFDiTVideo(nn.Module):
             ]
         )
 
-        self.u_final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
-        self.v_final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        self.u_final_layer = FinalLayer(
+            hidden_size, patch_size, self.out_channels, norm_eps=rmsnorm_eps
+        )
+        self.v_final_layer = FinalLayer(
+            hidden_size, patch_size, self.out_channels, norm_eps=rmsnorm_eps
+        )
+
+        if attn_res_block_size > 0:
+            # Output-side attention residual (one per head branch), applied
+            # to the final prefix sum before the head's FinalLayer -- the
+            # analogue of KimiLinearModel.output_attn_res_{norm,proj}.
+            self.rmsnorm_eps = rmsnorm_eps
+            self.u_out_res_norm = RMSNorm(hidden_size, eps=rmsnorm_eps)
+            self.v_out_res_norm = RMSNorm(hidden_size, eps=rmsnorm_eps)
+            self.u_out_res_proj = scaled_variance_linear(
+                hidden_size, 1, bias=False, init_constant=weight_init_constant
+            )
+            self.v_out_res_proj = scaled_variance_linear(
+                hidden_size, 1, bias=False, init_constant=weight_init_constant
+            )
 
     def unpatchify(self, x):
         """(B, N, patch_t*patch_h*patch_w*C) -> (B, C, T, H, W)."""
@@ -498,6 +761,54 @@ class IMFDiTVideo(nn.Module):
             dim=1,
         )
 
+    def _run_attn_res_blocks(self, prefix, snaps, blocks, start_idx):
+        """Run blocks under the Kimi-K3 attention-residual schedule.
+
+        Mirrors KimiDecoderLayer._forward_attn_residual: before each
+        sublayer the residual stream is re-mixed by a 1-query softmax over
+        its snapshots; every attn_res_block_size blocks the prefix sum is
+        snapshotted and the running sum restarts from the sublayer output.
+
+        Args:
+            prefix: (b, l, d) running residual prefix sum entering blocks.
+            snaps: list of (b, l, d) earlier snapshots (not mutated).
+            blocks: iterable of TransformerBlock.
+            start_idx: global index of blocks[0] (snapshot schedule is
+                indexed globally across shared trunk and head branch).
+
+        Returns:
+            (prefix, snaps): (b, l, d) final prefix sum and the extended
+            snapshot list (a new list; the input list is left untouched).
+        """
+        bs = self.attn_res_block_size
+        eps = self.rmsnorm_eps
+        snaps = list(snaps)
+        for j, block in enumerate(blocks):
+            i = start_idx + j
+            # ---- pre-attention re-mix (skipped while no snapshots exist)
+            if snaps:
+                h_in = attn_res_apply(
+                    prefix, snaps, block.attn_res_norm.weight,
+                    block.attn_res_proj.weight, eps,
+                )                                     # (b, l, d)
+            else:
+                h_in = prefix
+            fresh = i % bs == 0
+            if fresh:
+                snaps.append(prefix)                  # snapshot pre-block sum
+            a_out = block.attn(
+                block.norm1(h_in), self.rope_cos, self.rope_sin
+            ) * block.attn_scale                      # (b, l, d) gated attn
+            prefix = a_out if fresh else prefix + a_out
+            # ---- pre-MLP re-mix (snaps is non-empty from block 0 on)
+            h_in = attn_res_apply(
+                prefix, snaps, block.mlp_res_norm.weight,
+                block.mlp_res_proj.weight, eps,
+            )                                         # (b, l, d)
+            m_out = block.mlp(block.norm2(h_in)) * block.mlp_scale
+            prefix = prefix + m_out                   # (b, l, d)
+        return prefix, snaps
+
     def forward(self, x, t, h, w, t_min, t_max, y):
         """
         Forward pass of the video imfDiT model.
@@ -517,15 +828,38 @@ class IMFDiTVideo(nn.Module):
         # following https://arxiv.org/abs/2502.13129
         seq = self._build_sequence(x, h, w, t_min, t_max, y)
 
-        for block in self.shared_blocks:
-            seq = block(seq, self.rope_cos, self.rope_sin)
+        if self.attn_res_block_size > 0:
+            shared_depth = len(self.shared_blocks)
+            prefix, snaps = self._run_attn_res_blocks(
+                seq, [], self.shared_blocks, 0
+            )
+            u_prefix, u_snaps = self._run_attn_res_blocks(
+                prefix, snaps, self.u_heads, shared_depth
+            )
+            u_seq = attn_res_apply(
+                u_prefix, u_snaps, self.u_out_res_norm.weight,
+                self.u_out_res_proj.weight, self.rmsnorm_eps,
+            )
+            if len(self.v_heads) > 0:
+                v_prefix, v_snaps = self._run_attn_res_blocks(
+                    prefix, snaps, self.v_heads, shared_depth
+                )
+                v_seq = attn_res_apply(
+                    v_prefix, v_snaps, self.v_out_res_norm.weight,
+                    self.v_out_res_proj.weight, self.rmsnorm_eps,
+                )
+            else:
+                v_seq = u_seq
+        else:
+            for block in self.shared_blocks:
+                seq = block(seq, self.rope_cos, self.rope_sin)
 
-        u_seq = v_seq = seq
-        for block in self.u_heads:
-            u_seq = block(u_seq, self.rope_cos, self.rope_sin)
+            u_seq = v_seq = seq
+            for block in self.u_heads:
+                u_seq = block(u_seq, self.rope_cos, self.rope_sin)
 
-        for block in self.v_heads:
-            v_seq = block(v_seq, self.rope_cos, self.rope_sin)
+            for block in self.v_heads:
+                v_seq = block(v_seq, self.rope_cos, self.rope_sin)
 
         u_tokens = u_seq[:, self.prefix_tokens :]
         v_tokens = v_seq[:, self.prefix_tokens :]
