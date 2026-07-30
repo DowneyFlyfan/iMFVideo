@@ -147,6 +147,8 @@ def build_model():
         eval_mode=m.eval_mode,
         attn_impl=attn,
         attn_res_block_size=m.attn_res_block_size,
+        situ_beta=m.situ_beta,
+        situ_linear_beta=m.situ_linear_beta,
     )
     num_params = sum(p.numel() for p in net.parameters())
     assert (

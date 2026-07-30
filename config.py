@@ -35,6 +35,11 @@ class ModelConfig:
 
     # --- Feed-forward and normalization ---
     mlp_ratio: float = 8 / 3  # SwiGLU hidden = mlp_ratio * hidden_size
+    # Kimi-K3 SituAndMul activation: gate act = beta*tanh(g/beta)*sigmoid(g)
+    # (bounded SiLU; SiLU is the beta -> inf limit). situ_linear_beta also
+    # soft-clamps the up branch when set (None disables).
+    situ_beta: float = 1.0
+    situ_linear_beta: float | None = None
     rmsnorm_eps: float = 1e-6  # RMSNorm epsilon (float32 accumulation)
 
     # --- In-context conditioning token banks (prepended to the patch tokens) ---

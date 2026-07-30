@@ -107,10 +107,38 @@ class RMSNorm(nn.Module):
         return normed.to(x.dtype) * self.weight
 
 
-class SwiGLUMlp(nn.Module):
-    """Swish-Gated Linear Unit MLP."""
+class SituAndMul(nn.Module):
+    """Kimi-K3 gated activation (modeling_kimi_linear.SituAndMul).
 
-    def __init__(self, in_features, hidden_features, weight_init_constant=1.0):
+    situ(g) = beta * tanh(g / beta) * sigmoid(g): identical to SiLU for
+    |g| << beta and saturating at +-beta * sigmoid(g) for large |g|, so the
+    gate branch is bounded (outlier / massive-activation control). When
+    linear_beta is set the up branch is also soft-clamped by
+    linear_beta * tanh(up / linear_beta).
+    """
+
+    def __init__(self, beta=1.0, linear_beta=None):
+        super().__init__()
+        self.beta = beta
+        self.linear_beta = linear_beta
+
+    def forward(self, x):
+        # x: (..., 2F) rows [gate | up];  returns (..., F)
+        d = x.shape[-1] // 2
+        gate = x[..., :d].to(torch.float32)              # (..., F)
+        up = x[..., d:].to(torch.float32)                # (..., F)
+        situ_a = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
+        if self.linear_beta is not None:
+            up = self.linear_beta * torch.tanh(up / self.linear_beta)
+        return (situ_a * up).to(x.dtype)
+
+
+class SwiGLUMlp(nn.Module):
+    """Gated MLP with the Kimi-K3 SituAndMul activation (bounded SiLU
+    gate; plain SiLU is the beta -> inf limit)."""
+
+    def __init__(self, in_features, hidden_features, weight_init_constant=1.0,
+                 situ_beta=1.0, situ_linear_beta=None):
         super().__init__()
         linear = partial(
             scaled_variance_linear, bias=False, init_constant=weight_init_constant
@@ -118,9 +146,12 @@ class SwiGLUMlp(nn.Module):
         self.w1 = linear(in_features, hidden_features)
         self.w3 = linear(in_features, hidden_features)
         self.w2 = linear(hidden_features, in_features)
+        self.act = SituAndMul(beta=situ_beta, linear_beta=situ_linear_beta)
 
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        # x: (b, l, d) -> gate/up (b, l, F) each -> (b, l, d)
+        gu = torch.cat([self.w1(x), self.w3(x)], dim=-1)   # (b, l, 2F)
+        return self.w2(self.act(gu))
 
 
 class TimestepEmbedder(nn.Module):
@@ -396,6 +427,8 @@ class TransformerBlock(nn.Module):
         norm_eps=1e-6,
         attn_impl=sdpa_math_attention,
         use_attn_res=False,
+        situ_beta=1.0,
+        situ_linear_beta=None,
     ):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=norm_eps)
@@ -414,7 +447,8 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(hidden_size, eps=norm_eps)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp = SwiGLUMlp(
-            hidden_size, mlp_hidden_dim, weight_init_constant=weight_init_constant
+            hidden_size, mlp_hidden_dim, weight_init_constant=weight_init_constant,
+            situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
         )
 
         self.attn_scale = nn.Parameter(torch.zeros(hidden_size))
@@ -552,6 +586,8 @@ class IMFDiTVideo(nn.Module):
         attn_impl=sdpa_math_attention,
         eval_mode=False,
         attn_res_block_size=0,
+        situ_beta=1.0,
+        situ_linear_beta=None,
     ):
         super().__init__()
         self.head_dim = hidden_size // num_heads
@@ -676,6 +712,8 @@ class IMFDiTVideo(nn.Module):
             norm_eps=rmsnorm_eps,
             attn_impl=attn_impl,
             use_attn_res=attn_res_block_size > 0,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         self.shared_blocks = nn.ModuleList(
             [TransformerBlock(**block_kwargs) for _ in range(shared_depth)]
