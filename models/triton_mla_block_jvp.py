@@ -57,10 +57,171 @@ from models.triton_block_jvp import (
     _flash_jvp,
     _fp8_mm,
     _fp8_weight,
+    _stream_pair,
     _swiglu_jvp,
 )
 
 __all__ = ["triton_mla_block_jvp", "TritonMLABlockJVP", "mla_params_from_block"]
+
+
+# --------------------------------------------------------------------------
+# fp16 GEMM with fp16-accumulate tiles:  c[m, n] = sum_k a[m, k] * w[n, k]
+# (einsum "mk,nk->mn", i.e. A @ W^T with W stored (N, K) row-major).
+# Each BK-wide tl.dot accumulates in fp16 (2x MMA rate on GeForce, where
+# cuBLAS fp16 GEMMs run fp32-accumulate at half rate); the cross-chunk
+# accumulator is fp32, so per-element error stays at the fp16 BK-tile level.
+# --------------------------------------------------------------------------
+_MM16_CONFIGS = [
+    triton.Config({"BM": 128, "BN": 128, "BK": 64}, num_warps=8, num_stages=3),
+    triton.Config({"BM": 128, "BN": 128, "BK": 64}, num_warps=4, num_stages=3),
+    triton.Config({"BM": 128, "BN": 64, "BK": 64}, num_warps=4, num_stages=4),
+    triton.Config({"BM": 64, "BN": 128, "BK": 64}, num_warps=4, num_stages=4),
+    triton.Config({"BM": 128, "BN": 256, "BK": 64}, num_warps=8, num_stages=3),
+    triton.Config({"BM": 256, "BN": 128, "BK": 64}, num_warps=8, num_stages=3),
+    triton.Config({"BM": 128, "BN": 128, "BK": 128}, num_warps=8, num_stages=2),
+    triton.Config({"BM": 64, "BN": 256, "BK": 64}, num_warps=4, num_stages=4),
+    triton.Config({"BM": 256, "BN": 64, "BK": 64}, num_warps=4, num_stages=4),
+    triton.Config({"BM": 64, "BN": 128, "BK": 128}, num_warps=4, num_stages=3),
+    triton.Config({"BM": 128, "BN": 64, "BK": 128}, num_warps=4, num_stages=3),
+]
+
+
+@triton.autotune(configs=_MM16_CONFIGS, key=["M", "N", "K"])
+@triton.jit
+def _mm16_kernel(A, W, C, M, N, K,
+                 BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                 EVEN_M: tl.constexpr, EVEN_N: tl.constexpr,
+                 GM: tl.constexpr = 8):
+    # A (M, K) fp16 row-major;  W (N, K) fp16 row-major;  C (M, N) fp16
+    # 1D grid with grouped block ordering (GM row-blocks per column sweep)
+    # for L2 reuse of the W tiles.
+    pid = tl.program_id(0)
+    nbm = tl.cdiv(M, BM)
+    nbn = tl.cdiv(N, BN)
+    width = GM * nbn
+    gid = pid // width
+    first = gid * GM
+    gsz = tl.minimum(nbm - first, GM)
+    pid_m = first + (pid % width) % gsz
+    pid_n = (pid % width) // gsz
+    rm = pid_m * BM + tl.arange(0, BM)     # (BM,) output row index
+    rn = pid_n * BN + tl.arange(0, BN)     # (BN,) output col index
+    rk = tl.arange(0, BK)                  # (BK,) reduction index
+    ap = A + rm[:, None] * K + rk[None, :]           # (BM, BK) A tile ptrs
+    wp = W + rn[:, None] * K + rk[None, :]           # (BN, BK) W tile ptrs
+    acc = tl.zeros([BM, BN], tl.float32)   # (BM, BN) cross-chunk accumulator
+    for _ in range(0, K, BK):              # K is a multiple of BK for all uses
+        if EVEN_M:
+            a = tl.load(ap)
+        else:
+            a = tl.load(ap, mask=rm[:, None] < M, other=0.0)
+        if EVEN_N:
+            w = tl.load(wp)
+        else:
+            w = tl.load(wp, mask=rn[:, None] < N, other=0.0)
+        acc += tl.dot(a, tl.trans(w), out_dtype=tl.float16).to(tl.float32)
+        ap += BK
+        wp += BK
+    cp = C + rm[:, None] * N + rn[None, :]           # (BM, BN) C tile ptrs
+    if EVEN_M and EVEN_N:
+        tl.store(cp, acc.to(C.dtype.element_ty))
+    else:
+        tl.store(cp, acc.to(C.dtype.element_ty),
+                 mask=(rm[:, None] < M) & (rn[None, :] < N))
+
+
+def _mm16(a, w_nk):
+    """a (M, K) fp16 @ w_nk (N, K) fp16 -> (M, N) fp16 (A @ W^T).
+    K must be a multiple of 128 (largest BK); M and N are masked."""
+    M, K = a.shape
+    N = w_nk.shape[0]
+    c = torch.empty(M, N, device=a.device, dtype=torch.float16)
+    grid = lambda meta: (
+        triton.cdiv(M, meta["BM"]) * triton.cdiv(N, meta["BN"]),
+    )
+    _mm16_kernel[grid](
+        a, w_nk, c, M, N, K,
+        EVEN_M=(M % 256 == 0), EVEN_N=(N % 256 == 0),
+    )
+    return c
+
+
+# --------------------------------------------------------------------------
+# Down-projection GEMM with fused gated-residual epilogue:
+#   c[m, n] = sum_k act[m, k] * w_down[n, k]      (einsum "mk,nk->mn")
+#   primal rows (m < half):  y[m, n]  = res[m, n]  + c[m, n] * g[n]
+#   tangent rows (m >= half): dy[m', n] = dres[m', n] + c[m, n] * g[n]
+# fp16-accumulate tiles like _mm16; outputs written fp32 directly, so the
+# intermediate down-projection buffer, its re-read and the separate
+# gate-add launch all disappear.
+# --------------------------------------------------------------------------
+@triton.autotune(configs=_MM16_CONFIGS, key=["M", "N", "K"])
+@triton.jit
+def _mm16_gate_add_kernel(A, W, RES, G, Y, DY, M, N, K, half,
+                          BM: tl.constexpr, BN: tl.constexpr,
+                          BK: tl.constexpr,
+                          EVEN_M: tl.constexpr, EVEN_N: tl.constexpr,
+                          GM: tl.constexpr = 8):
+    # A (M, K) fp16;  W (N, K) fp16;  RES (M, N) fp16 stacked residual
+    # G (N,) fp32 gate;  Y/DY (half, N) fp32 primal/tangent outputs
+    # 1D grid, grouped ordering as in _mm16_kernel.
+    pid = tl.program_id(0)
+    nbm = tl.cdiv(M, BM)
+    nbn = tl.cdiv(N, BN)
+    width = GM * nbn
+    gid = pid // width
+    first = gid * GM
+    gsz = tl.minimum(nbm - first, GM)
+    pid_m = first + (pid % width) % gsz
+    pid_n = (pid % width) // gsz
+    rm = pid_m * BM + tl.arange(0, BM)     # (BM,) stacked row index
+    rn = pid_n * BN + tl.arange(0, BN)     # (BN,) output col index
+    rk = tl.arange(0, BK)                  # (BK,) reduction index
+    ap = A + rm[:, None] * K + rk[None, :]           # (BM, BK) A tile ptrs
+    wp = W + rn[:, None] * K + rk[None, :]           # (BN, BK) W tile ptrs
+    acc = tl.zeros([BM, BN], tl.float32)   # (BM, BN) cross-chunk accumulator
+    for _ in range(0, K, BK):
+        if EVEN_M:
+            a = tl.load(ap)
+        else:
+            a = tl.load(ap, mask=rm[:, None] < M, other=0.0)
+        if EVEN_N:
+            w = tl.load(wp)
+        else:
+            w = tl.load(wp, mask=rn[:, None] < N, other=0.0)
+        acc += tl.dot(a, tl.trans(w), out_dtype=tl.float16).to(tl.float32)
+        ap += BK
+        wp += BK
+    nmask = rn[None, :] < N
+    mmask = rm[:, None] < M
+    g = tl.load(G + rn, mask=rn < N, other=0.0).to(tl.float32)   # (BN,)
+    rp = RES + rm[:, None] * N + rn[None, :]         # (BM, BN) residual ptrs
+    r = tl.load(rp, mask=mmask & nmask, other=0.0).to(tl.float32)
+    outv = r + acc * g[None, :]            # (BM, BN) gated residual output
+    # A BM block may straddle the primal/tangent boundary: two masked
+    # stores, one per half, with per-row destination row indices.
+    p_mask = (rm[:, None] < half) & nmask
+    t_row = tl.maximum(rm - half, 0)       # (BM,) tangent-half row index
+    t_mask = (rm[:, None] >= half) & mmask & nmask
+    tl.store(Y + rm[:, None] * N + rn[None, :], outv, mask=p_mask)
+    tl.store(DY + t_row[:, None] * N + rn[None, :], outv, mask=t_mask)
+
+
+def _mm16_gate_add(a, w_nk, res, g, out_y, out_dy, half):
+    """a (M, K) fp16 @ w_nk (N, K) fp16, fused y/dy = res + c*g epilogue.
+
+    res (M, N) fp16 stacked residual; g (N,) fp32 gate;
+    out_y/out_dy (half, N) fp32 output views; half = M // 2.
+    """
+    M, K = a.shape
+    N = w_nk.shape[0]
+    grid = lambda meta: (
+        triton.cdiv(M, meta["BM"]) * triton.cdiv(N, meta["BN"]),
+    )
+    _mm16_gate_add_kernel[grid](
+        a, w_nk, res, g, out_y, out_dy, M, N, K, half,
+        EVEN_M=(M % 256 == 0), EVEN_N=(N % 256 == 0),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -118,42 +279,45 @@ def _q_prep_kernel(QB, WQN, COS, SIN, OUT,
                    so_b, so_s,       # batch/seq strides of packed out buffer
                    B, S, half,       # batch, seq len, half = B*S primal rows
                    eps,
+                   NH: tl.constexpr,     # number of heads H
                    DN: tl.constexpr,     # nope band width dn
                    DR2: tl.constexpr,    # rope angle pairs dr // 2
                    HD: tl.constexpr,     # head dim dn + dr (= 64)
                    BN: tl.constexpr,     # next_power_of_2(DN)
                    CLAMP: tl.constexpr): # clamp outputs into the fp8 range
+    # One program per token row; all NH heads processed as a 2D tile.
     pid = tl.program_id(0)             # token row in [0, B*S)
-    h = tl.program_id(1)               # head index in [0, H)
     b = pid // S                       # batch index
     s = pid % S                        # sequence position
-    src_p = pid * sq_row + h * HD      # primal head offset in QB
-    src_t = (pid + half) * sq_row + h * HD   # tangent head offset in QB
-    dst_p = b * so_b + s * so_s + h * HD     # primal head offset in OUT q slot
-    dst_t = (b + B) * so_b + s * so_s + h * HD
+    src_p = pid * sq_row               # primal row offset in QB
+    src_t = (pid + half) * sq_row      # tangent row offset in QB
+    dst_p = b * so_b + s * so_s        # primal row offset in OUT q slot
+    dst_t = (b + B) * so_b + s * so_s
 
-    # ---- nope band: per-head RMSNorm JVP over dn channels ----
-    cn = tl.arange(0, BN)              # (BN,) nope channel index
+    h2 = tl.arange(0, NH)[:, None]     # (NH, 1) head index
+    cn = tl.arange(0, BN)[None, :]     # (1, BN) nope channel index
     nm = cn < DN
-    xn = tl.load(QB + src_p + cn, mask=nm, other=0.0).to(tl.float32)
-    dn_ = tl.load(QB + src_t + cn, mask=nm, other=0.0).to(tl.float32)
-    w = tl.load(WQN + cn, mask=nm, other=0.0).to(tl.float32)
-    inv_r = 1.0 / tl.sqrt(tl.sum(xn * xn, axis=0) / DN + eps)
-    mxdx = tl.sum(xn * dn_, axis=0) / DN
-    yn = w * xn * inv_r
-    dyn = w * (dn_ * inv_r - xn * (mxdx * inv_r * inv_r * inv_r))
+    off_n = h2 * HD + cn               # (NH, BN) nope offsets within row
+    xn = tl.load(QB + src_p + off_n, mask=nm, other=0.0).to(tl.float32)
+    dn_ = tl.load(QB + src_t + off_n, mask=nm, other=0.0).to(tl.float32)
+    w = tl.load(WQN + cn, mask=nm, other=0.0).to(tl.float32)   # (1, BN)
+    inv_r = 1.0 / tl.sqrt(tl.sum(xn * xn, axis=1) / DN + eps)  # (NH,)
+    mxdx = tl.sum(xn * dn_, axis=1) / DN                       # (NH,)
+    ir = inv_r[:, None]                # (NH, 1)
+    yn = w * xn * ir
+    dyn = w * (dn_ * ir - xn * (mxdx[:, None] * ir * ir * ir))
     if CLAMP:
         yn = tl.clamp(yn, -448.0, 448.0)
         dyn = tl.clamp(dyn, -448.0, 448.0)
-    tl.store(OUT + dst_p + cn, yn.to(OUT.dtype.element_ty), mask=nm)
-    tl.store(OUT + dst_t + cn, dyn.to(OUT.dtype.element_ty), mask=nm)
+    tl.store(OUT + dst_p + off_n, yn.to(OUT.dtype.element_ty), mask=nm)
+    tl.store(OUT + dst_t + off_n, dyn.to(OUT.dtype.element_ty), mask=nm)
 
     # ---- rope band: rotation JVP (same rotation on primal and tangent) ----
-    i = tl.arange(0, DR2)              # (DR2,) angle-pair index
-    c = tl.load(COS + s * DR2 + i).to(tl.float32)   # (DR2,) cos(angle)
-    sn = tl.load(SIN + s * DR2 + i).to(tl.float32)  # (DR2,) sin(angle)
-    re = DN + 2 * i                    # channel of the pair's real part
-    im = DN + 2 * i + 1                # channel of the pair's imag part
+    i = tl.arange(0, DR2)[None, :]     # (1, DR2) angle-pair index
+    c = tl.load(COS + s * DR2 + i).to(tl.float32)   # (1, DR2) cos(angle)
+    sn = tl.load(SIN + s * DR2 + i).to(tl.float32)  # (1, DR2) sin(angle)
+    re = h2 * HD + DN + 2 * i          # (NH, DR2) real-part offsets
+    im = re + 1                        # (NH, DR2) imag-part offsets
     xr = tl.load(QB + src_p + re).to(tl.float32)
     xi = tl.load(QB + src_p + im).to(tl.float32)
     dxr = tl.load(QB + src_t + re).to(tl.float32)
@@ -187,6 +351,7 @@ def _kv_prep_kernel(KVB, KR, WKN, COS, SIN, OUTK, OUTV,
                     so_b, so_s,       # batch/seq strides of packed out buffer
                     B, S, half,       # batch, seq len, half = B*S primal rows
                     eps,
+                    NH: tl.constexpr,     # number of heads H
                     DN: tl.constexpr,     # nope band width dn
                     DR2: tl.constexpr,    # rope angle pairs dr // 2
                     DV: tl.constexpr,     # value head dim dv (= 64)
@@ -194,51 +359,52 @@ def _kv_prep_kernel(KVB, KR, WKN, COS, SIN, OUTK, OUTV,
                     BN: tl.constexpr,     # next_power_of_2(DN)
                     KVW: tl.constexpr,    # kv_b per-head width dn + dv
                     CLAMP: tl.constexpr): # clamp outputs into the fp8 range
+    # One program per token row; all NH heads processed as a 2D tile.
     pid = tl.program_id(0)             # token row in [0, B*S)
-    h = tl.program_id(1)               # head index in [0, H)
     b = pid // S
     s = pid % S
-    src_p = pid * skv_row + h * KVW    # primal head offset in KVB
-    src_t = (pid + half) * skv_row + h * KVW
-    dk_p = b * so_b + s * so_s + h * HD    # primal head offset in OUT k slot
-    dk_t = (b + B) * so_b + s * so_s + h * HD
-    dv_p = b * so_b + s * so_s + h * DV    # primal head offset in OUT v slot
-    dv_t = (b + B) * so_b + s * so_s + h * DV
+    src_p = pid * skv_row              # primal row offset in KVB
+    src_t = (pid + half) * skv_row     # tangent row offset in KVB
+    dst_p = b * so_b + s * so_s        # primal row offset in OUT k/v slots
+    dst_t = (b + B) * so_b + s * so_s
 
-    # ---- k_nope: per-head RMSNorm JVP over dn channels ----
-    cn = tl.arange(0, BN)
+    h2 = tl.arange(0, NH)[:, None]     # (NH, 1) head index
+    cn = tl.arange(0, BN)[None, :]     # (1, BN) nope channel index
     nm = cn < DN
-    xn = tl.load(KVB + src_p + cn, mask=nm, other=0.0).to(tl.float32)
-    dn_ = tl.load(KVB + src_t + cn, mask=nm, other=0.0).to(tl.float32)
-    w = tl.load(WKN + cn, mask=nm, other=0.0).to(tl.float32)
-    inv_r = 1.0 / tl.sqrt(tl.sum(xn * xn, axis=0) / DN + eps)
-    mxdx = tl.sum(xn * dn_, axis=0) / DN
-    yn = w * xn * inv_r
-    dyn = w * (dn_ * inv_r - xn * (mxdx * inv_r * inv_r * inv_r))
+    off_in = h2 * KVW + cn             # (NH, BN) k_nope offsets in KVB row
+    off_out = h2 * HD + cn             # (NH, BN) k_nope offsets in OUT row
+    xn = tl.load(KVB + src_p + off_in, mask=nm, other=0.0).to(tl.float32)
+    dn_ = tl.load(KVB + src_t + off_in, mask=nm, other=0.0).to(tl.float32)
+    w = tl.load(WKN + cn, mask=nm, other=0.0).to(tl.float32)   # (1, BN)
+    inv_r = 1.0 / tl.sqrt(tl.sum(xn * xn, axis=1) / DN + eps)  # (NH,)
+    mxdx = tl.sum(xn * dn_, axis=1) / DN                       # (NH,)
+    ir = inv_r[:, None]                # (NH, 1)
+    yn = w * xn * ir
+    dyn = w * (dn_ * ir - xn * (mxdx[:, None] * ir * ir * ir))
     if CLAMP:
         yn = tl.clamp(yn, -448.0, 448.0)
         dyn = tl.clamp(dyn, -448.0, 448.0)
-    tl.store(OUTK + dk_p + cn, yn.to(OUTK.dtype.element_ty), mask=nm)
-    tl.store(OUTK + dk_t + cn, dyn.to(OUTK.dtype.element_ty), mask=nm)
+    tl.store(OUTK + dst_p + off_out, yn.to(OUTK.dtype.element_ty), mask=nm)
+    tl.store(OUTK + dst_t + off_out, dyn.to(OUTK.dtype.element_ty), mask=nm)
 
-    # ---- shared k_rope: RoPE rotation JVP, identical for every head ----
-    i = tl.arange(0, DR2)
-    c = tl.load(COS + s * DR2 + i).to(tl.float32)
-    sn = tl.load(SIN + s * DR2 + i).to(tl.float32)
-    xr = tl.load(KR + pid * skr_row + 2 * i).to(tl.float32)
+    # ---- shared k_rope: RoPE rotation JVP, broadcast over heads ----
+    i = tl.arange(0, DR2)[None, :]     # (1, DR2) angle-pair index
+    c = tl.load(COS + s * DR2 + i).to(tl.float32)   # (1, DR2)
+    sn = tl.load(SIN + s * DR2 + i).to(tl.float32)  # (1, DR2)
+    xr = tl.load(KR + pid * skr_row + 2 * i).to(tl.float32)          # (1, DR2)
     xi = tl.load(KR + pid * skr_row + 2 * i + 1).to(tl.float32)
     dxr = tl.load(KR + (pid + half) * skr_row + 2 * i).to(tl.float32)
     dxi = tl.load(KR + (pid + half) * skr_row + 2 * i + 1).to(tl.float32)
-    re = DN + 2 * i
-    im = DN + 2 * i + 1
-    yr = xr * c - xi * sn
-    yi = xr * sn + xi * c
-    dyr = dxr * c - dxi * sn
-    dyi = dxr * sn + dxi * c
+    yr = (xr * c - xi * sn) + tl.zeros([NH, DR2], tl.float32)   # broadcast
+    yi = (xr * sn + xi * c) + tl.zeros([NH, DR2], tl.float32)
+    dyr = (dxr * c - dxi * sn) + tl.zeros([NH, DR2], tl.float32)
+    dyi = (dxr * sn + dxi * c) + tl.zeros([NH, DR2], tl.float32)
     # ---- v: straight copy of the dv band (JVP of a copy is a copy) ----
-    cv = tl.arange(0, DV)              # (DV,) value channel index
-    v = tl.load(KVB + src_p + DN + cv).to(tl.float32)
-    dv_ = tl.load(KVB + src_t + DN + cv).to(tl.float32)
+    cv = tl.arange(0, DV)[None, :]     # (1, DV) value channel index
+    off_v_in = h2 * KVW + DN + cv      # (NH, DV) v offsets in KVB row
+    off_v_out = h2 * DV + cv           # (NH, DV) v offsets in OUT v slot
+    v = tl.load(KVB + src_p + off_v_in).to(tl.float32)
+    dv_ = tl.load(KVB + src_t + off_v_in).to(tl.float32)
     if CLAMP:
         yr = tl.clamp(yr, -448.0, 448.0)
         yi = tl.clamp(yi, -448.0, 448.0)
@@ -246,12 +412,78 @@ def _kv_prep_kernel(KVB, KR, WKN, COS, SIN, OUTK, OUTV,
         dyi = tl.clamp(dyi, -448.0, 448.0)
         v = tl.clamp(v, -448.0, 448.0)
         dv_ = tl.clamp(dv_, -448.0, 448.0)
-    tl.store(OUTK + dk_p + re, yr.to(OUTK.dtype.element_ty))
-    tl.store(OUTK + dk_p + im, yi.to(OUTK.dtype.element_ty))
-    tl.store(OUTK + dk_t + re, dyr.to(OUTK.dtype.element_ty))
-    tl.store(OUTK + dk_t + im, dyi.to(OUTK.dtype.element_ty))
-    tl.store(OUTV + dv_p + cv, v.to(OUTV.dtype.element_ty))
-    tl.store(OUTV + dv_t + cv, dv_.to(OUTV.dtype.element_ty))
+    re = h2 * HD + DN + 2 * i          # (NH, DR2) real-part offsets in OUT
+    im = re + 1
+    tl.store(OUTK + dst_p + re, yr.to(OUTK.dtype.element_ty))
+    tl.store(OUTK + dst_p + im, yi.to(OUTK.dtype.element_ty))
+    tl.store(OUTK + dst_t + re, dyr.to(OUTK.dtype.element_ty))
+    tl.store(OUTK + dst_t + im, dyi.to(OUTK.dtype.element_ty))
+    tl.store(OUTV + dst_p + off_v_out, v.to(OUTV.dtype.element_ty))
+    tl.store(OUTV + dst_t + off_v_out, dv_.to(OUTV.dtype.element_ty))
+
+
+# --------------------------------------------------------------------------
+# Row-based SwiGLU JVP:  h = silu(g)*u,  dh = silu'(g)*dg*u + silu(g)*du,
+# silu'(g) = sigmoid(g)*(1 + g*(1 - sigmoid(g))).
+# GU rows are [gate | up] of width 2F; one program per (row, F-chunk) with
+# plain vector loads (no per-element div/mod as in the flat kernel).
+# --------------------------------------------------------------------------
+@triton.jit
+def _swiglu_row_jvp_kernel(GU, DGU, Hout, DHout, F, BLOCK: tl.constexpr,
+                           CLAMP: tl.constexpr):
+    # GU/DGU: primal/tangent rows of width 2F ([gate | up]); Hout/DHout:
+    # output rows of width F
+    row = tl.program_id(0)             # token row index
+    cb = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)   # (BLOCK,) col
+    mask = cb < F
+    base = row * (2 * F) + cb
+    g = tl.load(GU + base, mask=mask, other=0.0).to(tl.float32)
+    u = tl.load(GU + base + F, mask=mask, other=0.0).to(tl.float32)
+    dg = tl.load(DGU + base, mask=mask, other=0.0).to(tl.float32)
+    du = tl.load(DGU + base + F, mask=mask, other=0.0).to(tl.float32)
+    sig = tl.sigmoid(g)
+    silu = g * sig
+    dsilu = sig * (1.0 + g * (1.0 - sig))
+    h = silu * u
+    dh = dsilu * dg * u + silu * du
+    if CLAMP:
+        h = tl.clamp(h, -448.0, 448.0)
+        dh = tl.clamp(dh, -448.0, 448.0)
+    op = row * F + cb
+    tl.store(Hout + op, h.to(Hout.dtype.element_ty), mask=mask)
+    tl.store(DHout + op, dh.to(DHout.dtype.element_ty), mask=mask)
+
+
+def _swiglu_row_jvp(gu, dgu, h, dh, n_rows, f):
+    # gu/dgu: (n_rows, 2F) fp16 primal/tangent; h/dh: (n_rows, F) outputs
+    BLOCK = 1024
+    _swiglu_row_jvp_kernel[(n_rows, triton.cdiv(f, BLOCK))](
+        gu, dgu, h, dh, f, BLOCK=BLOCK, num_warps=4,
+        CLAMP=(h.dtype == _FP8),
+    )
+
+
+# --------------------------------------------------------------------------
+# Fused gated final add:  y = res + dwn * g   (fp32 out, both halves in one
+# launch; avoids the fp32 temporary that `res + dwn * g` in torch would
+# materialize for the product).
+# --------------------------------------------------------------------------
+@triton.jit
+def _gate_add_kernel(RES, DRES, DWN, DDWN, G, Y, DY, D, total,
+                     BLOCK: tl.constexpr):
+    # RES/DRES: (total,) fp16 primal/tangent residual rows (flattened)
+    # DWN/DDWN: (total,) fp16 primal/tangent down-projection rows
+    # G: (D,) fp32 vector gate;  Y/DY: (total,) fp32 outputs
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)   # flat element index
+    mask = i < total
+    col = i % D                                          # channel index
+    g = tl.load(G + col, mask=mask, other=0.0).to(tl.float32)
+    r = tl.load(RES + i, mask=mask, other=0.0).to(tl.float32)
+    dr_ = tl.load(DRES + i, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(DWN + i, mask=mask, other=0.0).to(tl.float32)
+    dw = tl.load(DDWN + i, mask=mask, other=0.0).to(tl.float32)
+    tl.store(Y + i, r + w * g, mask=mask)
+    tl.store(DY + i, dr_ + dw * g, mask=mask)
 
 
 # --------------------------------------------------------------------------
@@ -293,25 +525,26 @@ def _res_gate_norm_jvp_kernel(P, DP, G, X, DX, W, RES, DRES, Y, DY, D, eps,
 # --------------------------------------------------------------------------
 # Full MLA block JVP (fp32 io fast path)
 # --------------------------------------------------------------------------
-def _pad_rows_16(w):
-    """Zero-pad the leading (output) dim of w (N, K) to a multiple of 16.
+def _pad_rows_128(w):
+    """Zero-pad the leading (output) dim of w (N, K) to a multiple of 128
+    (the largest _mm16 K-chunk; also covers the fp8 16-alignment).
     Padded gate/up rows give silu(0)*0 = 0 through SwiGLU, and padded down
     columns then multiply those exact zeros, so the block output is
     unchanged."""
     n = w.shape[0]
-    n16 = (n + 15) // 16 * 16
-    if n16 == n:
+    n_pad = (n + 127) // 128 * 128
+    if n_pad == n:
         return w
-    return torch.cat([w, w.new_zeros(n16 - n, w.shape[1])], dim=0)
+    return torch.cat([w, w.new_zeros(n_pad - n, w.shape[1])], dim=0)
 
 
-def _pad_cols_16(w):
-    """Zero-pad the trailing (input) dim of w (N, K) to a multiple of 16."""
+def _pad_cols_128(w):
+    """Zero-pad the trailing (input) dim of w (N, K) to a multiple of 128."""
     k = w.shape[1]
-    k16 = (k + 15) // 16 * 16
-    if k16 == k:
+    k_pad = (k + 127) // 128 * 128
+    if k_pad == k:
         return w
-    return torch.cat([w, w.new_zeros(w.shape[0], k16 - k)], dim=1)
+    return torch.cat([w, w.new_zeros(w.shape[0], k_pad - k)], dim=1)
 
 
 def _mla_fused_weights(p):
@@ -329,9 +562,9 @@ def _mla_fused_weights(p):
         "w_kvb": p["w_kvb"],
         "w_out": p["w_out"],
         "w_gate_up": torch.cat(
-            [_pad_rows_16(p["w_gate"]), _pad_rows_16(p["w_up"])], dim=0
+            [_pad_rows_128(p["w_gate"]), _pad_rows_128(p["w_up"])], dim=0
         ),
-        "w_down": _pad_cols_16(p["w_down"]),
+        "w_down": _pad_cols_128(p["w_down"]),
     }
 
 
@@ -369,6 +602,42 @@ def triton_mla_block_jvp(x, dx, params, rope_cos, rope_sin, eps=1e-6,
     assert x.is_cuda and x.is_contiguous() and dx.is_contiguous()
     assert x.dtype == torch.float32
     assert variant in ("fp16", "fp8")
+    B = x.shape[0]                         # b
+    y = torch.empty_like(x)                # (b, l, d) fp32 primal out
+    dy = torch.empty_like(x)               # (b, l, d) fp32 tangent out
+    if B >= 2 and B % 2 == 0:
+        # Two batch chunks on two CUDA streams: attention is per-batch
+        # independent, so chunking is exact; the memory-bound stages of one
+        # chunk overlap the tensor-core stages of the other.
+        h_b = B // 2                       # chunk batch size
+        cur = torch.cuda.current_stream()
+        ev = torch.cuda.Event()
+        ev.record(cur)
+        capturing = torch.cuda.is_current_stream_capturing()
+        for st, sl in zip(_stream_pair(x.device),
+                          (slice(0, h_b), slice(h_b, B))):
+            st.wait_event(ev)
+            with torch.cuda.stream(st):
+                if not capturing:
+                    # allocator cross-stream safety; disallowed (and
+                    # unnecessary, graphs own their pool) during capture
+                    x.record_stream(st)
+                    dx.record_stream(st)
+                _mla_chunk(x[sl], dx[sl], params, rope_cos, rope_sin, eps,
+                           variant, y[sl], dy[sl])
+            cur.wait_stream(st)
+    else:
+        _mla_chunk(x, dx, params, rope_cos, rope_sin, eps, variant, y, dy)
+    return y, dy
+
+
+def _mla_chunk(x, dx, params, rope_cos, rope_sin, eps, variant, out_y, out_dy):
+    """One batch chunk of the MLA block JVP pipeline.
+
+    x, dx: (b, l, d) fp32 contiguous-in-row views (batch slices of the full
+    input are fine: slicing dim 0 keeps rows contiguous).
+    out_y, out_dy: (b, l, d) fp32 views to write the outputs into.
+    """
     B, S, D = x.shape                      # b, l, d
     H = params["H"]
     dq, dc = params["dq"], params["dc"]
@@ -394,9 +663,9 @@ def triton_mla_block_jvp(x, dx, params, rope_cos, rope_sin, eps=1e-6,
         f = w["w_gate_up"].shape[0] // 2   # padded SwiGLU width F
 
         def mm(a2d, key):
-            # a2d (M, K) fp16 @ fp16 weight (N, K) -> (M, N) fp16, cuBLAS
-            # fp16 tensor cores with fp32 accumulation
-            return a2d @ w[key].t()
+            # a2d (M, K) fp16 @ fp16 weight (N, K) -> (M, N) fp16 via the
+            # Triton fp16-accumulate GEMM (2x the cuBLAS fp32-acc rate)
+            return _mm16(a2d, w[key])
 
     clamp = variant == "fp8"               # fp8 range clamp in prep kernels
 
@@ -432,16 +701,16 @@ def triton_mla_block_jvp(x, dx, params, rope_cos, rope_sin, eps=1e-6,
     kv_ = packed[:, :, 1]                 # (2b, l, H, 64) k slot view
     vv = packed[:, :, 2]                  # (2b, l, H, 64) v slot view
     BN = triton.next_power_of_2(dn)
-    _q_prep_kernel[(half, H)](
+    _q_prep_kernel[(half,)](
         qb, params["w_qnorm"], rope_cos, rope_sin, qv,
         H * hd, so_b, so_s, B, S, half, eps,
-        DN=dn, DR2=dr // 2, HD=hd, BN=BN, CLAMP=clamp, num_warps=1,
+        NH=H, DN=dn, DR2=dr // 2, HD=hd, BN=BN, CLAMP=clamp, num_warps=4,
     )
-    _kv_prep_kernel[(half, H)](
+    _kv_prep_kernel[(half,)](
         kvb, a[:, dq + dc:], params["w_knorm"], rope_cos, rope_sin, kv_, vv,
         H * (dn + dv), wa, so_b, so_s, B, S, half, eps,
-        DN=dn, DR2=dr // 2, DV=dv, HD=hd, BN=BN, KVW=dn + dv, CLAMP=clamp,
-        num_warps=1,
+        NH=H, DN=dn, DR2=dr // 2, DV=dv, HD=hd, BN=BN, KVW=dn + dv,
+        CLAMP=clamp, num_warps=4,
     )
 
     # ---- fused flash-attention JVP (fp16/fp8 io, fp32 softmax stats) ----
@@ -467,15 +736,21 @@ def triton_mla_block_jvp(x, dx, params, rope_cos, rope_sin, eps=1e-6,
     # gu[m, j] = sum_k n2[m, k] * w_gate_up[j, k]    (einsum "mk,jk->mj")
     gu = mm(xs.view(M, D), "w_gate_up").view(2 * B, S, 2 * f)
     act = torch.empty(2 * B, S, f, device=dev, dtype=act_dt)
-    _swiglu_jvp(gu[:B], gu[B:], act[:B], act[B:])
+    _swiglu_row_jvp(gu[:B], gu[B:], act[:B], act[B:], half, f)
 
-    # ---- down projection + gated final residual add (fp32 out) ----
+    # ---- down projection with fused gated final residual add (fp32 out) ----
     # dwn[m, j] = sum_k act[m, k] * w_down[j, k]     (einsum "mk,jk->mj")
-    dwn = mm(act.view(M, f), "w_down").view(2 * B, S, D)
-    g_mlp = params["g_mlp"]               # (d,) fp32 vector gate
-    y = res[:B] + dwn[:B] * g_mlp         # (b, l, d) fp32 (promotion)
-    dy = res[B:] + dwn[B:] * g_mlp        # (b, l, d) fp32
-    return y, dy
+    if variant == "fp16":
+        _mm16_gate_add(act.view(M, f), w["w_down"], res.view(M, D),
+                       params["g_mlp"], out_y, out_dy, half)
+    else:
+        dwn = mm(act.view(M, f), "w_down").view(2 * B, S, D)
+        total = half * D                  # elements per half
+        BLK = 1024
+        _gate_add_kernel[(triton.cdiv(total, BLK),)](
+            res[:B], res[B:], dwn[:B], dwn[B:], params["g_mlp"],
+            out_y, out_dy, D, total, BLOCK=BLK, num_warps=4,
+        )
 
 
 def mla_params_from_block(block):
@@ -524,18 +799,47 @@ class TritonMLABlockJVP(nn.Module):
     cos/sin (l, dr//2) fp32.
     """
 
-    def __init__(self, block, eps=1e-6, variant="fp16"):
+    def __init__(self, block, eps=1e-6, variant="fp16", use_graph=True):
         super().__init__()
         self.eps = eps
         self.variant = variant
+        self.use_graph = use_graph
         self.params = mla_params_from_block(block)
         if variant == "fp8":
             self.params["_fp8"] = _mla_fp8_cache(self.params)
         else:
             self.params["_fp16"] = _mla_fp16_cache(self.params)
+        # CUDA-graph cache: (b, l) -> (graph, static x/dx/y/dy buffers).
+        # Replay writes the outputs into the SAME static y/dy tensors each
+        # call; consume them before the next forward (true in a training
+        # step, where the loss is computed immediately).
+        self._graphs = {}
 
-    def forward(self, x, dx, rope_cos, rope_sin):
+    def _run(self, x, dx, rope_cos, rope_sin):
         return triton_mla_block_jvp(
             x, dx, self.params, rope_cos, rope_sin, eps=self.eps,
             variant=self.variant,
         )
+
+    def forward(self, x, dx, rope_cos, rope_sin):
+        if not self.use_graph:
+            return self._run(x, dx, rope_cos, rope_sin)
+        key = (x.shape[0], x.shape[1])     # (b, l) static-shape key
+        entry = self._graphs.get(key)
+        if entry is None:
+            # warm up allocator/autotuner outside capture, then capture
+            sx = x.clone()                 # (b, l, d) static input primal
+            sdx = dx.clone()               # (b, l, d) static input tangent
+            for _ in range(2):
+                self._run(sx, sdx, rope_cos, rope_sin)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                sy, sdy = self._run(sx, sdx, rope_cos, rope_sin)
+            entry = (graph, sx, sdx, sy, sdy)
+            self._graphs[key] = entry
+        graph, sx, sdx, sy, sdy = entry
+        sx.copy_(x)
+        sdx.copy_(dx)
+        graph.replay()
+        return sy, sdy

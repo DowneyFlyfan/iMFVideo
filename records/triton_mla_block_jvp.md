@@ -6,7 +6,9 @@
 
 ## Variants
 
-- `variant="fp16"` (default): fp16 weights + fp16 activations, cuBLAS fp16 GEMMs with fp32 accumulation, fp16 flash-attention JVP core (fp16-accumulate per-tile dots, fp32 softmax statistics and cross-tile accumulation). No fp8 anywhere.
+- `variant="fp16"` (default): fp16 weights + fp16 activations, custom Triton fp16-accumulate GEMMs (per-BK-chunk fp16 `tl.dot`, fp32 cross-chunk accumulation, grouped-L2 block ordering; cuBLAS fp16 GEMMs run fp32-accumulate at half rate on GeForce), fp16 flash-attention JVP core (fp16-accumulate per-tile dots, fp32 softmax statistics and cross-tile accumulation). No fp8 anywhere.
+
+- fp16 optimization ladder from the first cuBLAS version (3.391 ms at (2, 2048, 1024)): Triton fp16-acc GEMMs (-0.58 ms), head-vectorized q/kv prep kernels + fused gated-add epilogue on the down GEMM, two-stream batch chunking (exact; memory-bound stages of one chunk overlap tensor-core stages of the other), optional CUDA-graph replay in the module wrapper (biggest effect at small shapes: 0.923 -> 0.840 ms at (8, 210)). SwiGLU width padded 2730 -> 2816 (multiple of 128 for the largest GEMM K-chunk).
 
 - `variant="fp8"`: fp8 `torch._scaled_mm` GEMMs with per-tensor weight scales, fp8 activations quantized inside the producing kernels.
 
@@ -85,26 +87,25 @@ $$
 
 ## Results
 
-- Speed (median CUDA-event ms; eager = `torch.func.jvp` through the fp32 `TransformerBlock`, sdpa math backend):
+- Speed (median CUDA-event ms; eager = `torch.func.jvp` through the fp32 `TransformerBlock`, sdpa math backend; eager measured before any Triton allocations):
 
-| shape (b, l, d) | eager fp32 jvp | fp16 variant | fp8 variant | fp16 speedup | fp8 speedup |
+| shape (b, l, d) | eager fp32 jvp | fp16 variant | fp16 speedup | fp8 variant | fp8 speedup |
 |---|---|---|---|---|---|
-| (2, 2048, 1024) | 39.69 ms | 3.391 ms | 1.930 ms | 11.71x | 20.57x |
-| (2, 4096, 1024) | 124.83 ms | 8.267 ms | 4.712 ms | 15.10x | 26.49x |
-| (8, 210, 1024) | 9.52 ms | 1.150 ms | 0.689 ms | 8.28x | 13.81x |
+| (2, 2048, 1024) | 39.88 ms | 2.643 ms | 15.05 - 15.15x (4 reps) | 1.66 ms | 23.8x |
+| (2, 4096, 1024) | 125.07 ms | 6.878 ms | 18.19x | 4.21 ms | 26.5x |
+| (1, 4096, 1024) | 61.78 ms | 3.428 ms | 18.02x | - | - |
+| (8, 210, 1024) | 9.50 ms | 0.840 ms | 11.31x | 0.527 ms | 18.05x |
 
-- The (2, 4096) eager number is from a run with the memory free to hold the four (b, H, l, l) score/prob buffers; with both variant weight caches resident it OOMs on 16 GB.
-
-- The small (8, 210) shape is kernel-launch-overhead-dominated for the fp16 variant (8.28x); the 10x target shape class is the long-sequence one.
+- (2, 4096) eager needs ~15 GB peak for the four (b, H, l, l) fp32 score/prob buffers under jvp and only fits with a favourable allocator state; (1, 4096) always fits and is the shape asserted in CI.
 
 - Accuracy (relative Frobenius error vs fp64 eager reference):
 
 | shape | fp16 y | fp16 dy | fp8 y | fp8 dy | eager fp32 y |
 |---|---|---|---|---|---|
 | (2, 512, 1024) | 2.08e-04 | 2.08e-04 | 6.93e-04 | 1.01e-03 | 3.63e-08 |
-| (1, 210, 1024) | 2.07e-04 | 2.08e-04 | 7.96e-04 | 1.24e-03 | 3.64e-08 |
+| (1, 210, 1024) | 2.08e-04 | 2.08e-04 | 7.96e-04 | 1.24e-03 | 3.64e-08 |
 
-- Tests: `tests/test_triton_mla_block_jvp.py`, 8/8 passed (fp64 reference match at three shapes x two variants including odd sequence length 210, module/functional bit-equality, >= 10x fp16 speed assert at (2, 2048, 1024)).
+- Tests: `tests/test_triton_mla_block_jvp.py`, 9/9 passed (fp64 reference match at three shapes x two variants including odd sequence length 210, module/functional bit-equality, speed asserts: >= 14x at (2, 2048, 1024) with noise guard, >= 15x at (1, 4096, 1024)).
 
 ## Files
 

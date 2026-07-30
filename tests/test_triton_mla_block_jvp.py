@@ -136,28 +136,50 @@ def _bench(fn, iters=20, warmup=5):
     return times[len(times) // 2]
 
 
-def test_speedup_at_least_10x_fp16(block32):
-    """fp16 variant (no fp8 anywhere) >= 10x vs pure-PyTorch eager fp32
-    jvp at (2, 2048, 1024).
-
-    (2, 4096) is infeasible for the eager baseline on 16 GB: sdpa math
-    materializes four (b, H, l, l) fp32 score/prob buffers under jvp.
-    Attention is quadratic in l, so 2048 is the conservative shape for
-    the speedup claim.
-    """
+def test_speedup_fp16_2048(block32):
+    """fp16 variant (no fp8 anywhere) vs pure-PyTorch eager fp32 jvp at
+    (2, 2048, 1024). Measured 15.05-15.15x; asserted with a noise guard
+    band."""
     b, l = 2, 2048
     torch.manual_seed(4)
     x = torch.randn(b, l, D, device="cuda")            # (b, l, d)
     dx = torch.randn(b, l, D, device="cuda")           # (b, l, d)
     cos, sin = make_rope(l)
-    mod = TritonMLABlockJVP(block32, variant="fp16")
-
-    t_triton = _bench(lambda: mod(x, dx, cos, sin))
     t_eager = _bench(lambda: eager_jvp(block32, x, dx, cos, sin), iters=10)
+    torch.cuda.empty_cache()
+    mod = TritonMLABlockJVP(block32, variant="fp16")
+    t_triton = _bench(lambda: mod(x, dx, cos, sin))
     speedup = t_eager / t_triton
     print(f"\n(2, {l}, {D}) fp16: eager fp32 {t_eager:.2f} ms, "
           f"triton {t_triton:.3f} ms, speedup {speedup:.2f}x")
-    assert speedup >= 10.0, f"only {speedup:.2f}x"
+    assert speedup >= 14.0, f"only {speedup:.2f}x"
+
+
+def test_speedup_at_least_15x_fp16_4096(block32):
+    """fp16 variant >= 15x vs eager fp32 jvp at (1, 4096, 1024), the
+    model-scale sequence length (b=1 keeps the eager (b, H, l, l) fp32
+    score/prob buffers inside 16 GB regardless of allocator state; b=2
+    is borderline and measured 18.19x in dedicated runs). Eager is
+    measured FIRST."""
+    b, l = 1, 4096
+    torch.manual_seed(4)
+    x = torch.randn(b, l, D, device="cuda")            # (b, l, d)
+    dx = torch.randn(b, l, D, device="cuda")           # (b, l, d)
+    cos, sin = make_rope(l)
+    torch.cuda.empty_cache()
+    try:
+        t_eager = _bench(lambda: eager_jvp(block32, x, dx, cos, sin),
+                         iters=10)
+    except torch.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        pytest.skip("eager fp32 jvp at (1, 4096) does not fit on this GPU")
+    torch.cuda.empty_cache()
+    mod = TritonMLABlockJVP(block32, variant="fp16")
+    t_triton = _bench(lambda: mod(x, dx, cos, sin))
+    speedup = t_eager / t_triton
+    print(f"\n(2, {l}, {D}) fp16: eager fp32 {t_eager:.2f} ms, "
+          f"triton {t_triton:.3f} ms, speedup {speedup:.2f}x")
+    assert speedup >= 15.0, f"only {speedup:.2f}x"
 
 
 if __name__ == "__main__":
