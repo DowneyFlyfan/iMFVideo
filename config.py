@@ -32,15 +32,17 @@ class ModelConfig:
     in_channels: int = 16  # Wan2.1 VAE latent channels
     num_classes: int = 1000
     attn_impl: str = "flash_jvp"  # "flash_jvp" (CuTeDSL kernels) | "sdpa" (math, slow)
+    # Kimi-K3 mla_use_output_gate: attn output modulated by sigmoid(g_proj(x)).
+    mla_use_output_gate: bool = True
 
     # --- Feed-forward and normalization ---
     mlp_ratio: float = 8 / 3  # SwiGLU hidden = mlp_ratio * hidden_size
     # Kimi-K3 SituAndMul activation: gate act = beta*tanh(g/beta)*sigmoid(g)
     # (bounded SiLU; SiLU is the beta -> inf limit). situ_linear_beta also
     # soft-clamps the up branch when set (None disables).
-    situ_beta: float = 1.0
-    situ_linear_beta: float | None = None
-    rmsnorm_eps: float = 1e-6  # RMSNorm epsilon (float32 accumulation)
+    situ_beta: float = 4.0  # Kimi-K3 production value (activation_situ_beta)
+    situ_linear_beta: float | None = 25.0  # Kimi-K3 activation_situ_linear_beta
+    rmsnorm_eps: float = 1e-5  # RMSNorm epsilon (Kimi-K3 rms_norm_eps)
 
     # --- In-context conditioning token banks (prepended to the patch tokens) ---
     num_class_tokens: int = 8

@@ -330,6 +330,7 @@ class MLAAttention(nn.Module):
         weight_init_constant=1.0,
         norm_eps=1e-6,
         attn_impl=sdpa_math_attention,
+        use_output_gate=True,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -354,6 +355,12 @@ class MLAAttention(nn.Module):
             kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim)
         )
         self.out_proj = linear(num_heads * v_head_dim, hidden_size)
+        # Kimi-K3 MLA output gate (mla_use_output_gate): the attention
+        # output is modulated per channel by sigmoid(g_proj(x)) before the
+        # output projection.
+        self.use_output_gate = use_output_gate
+        if use_output_gate:
+            self.g_proj = linear(hidden_size, num_heads * v_head_dim)
 
         # Latent-space norms (DeepSeek-V2/V3 placement).
         self.q_a_layernorm = RMSNorm(q_lora_rank, eps=norm_eps)
@@ -407,7 +414,10 @@ class MLAAttention(nn.Module):
         # attn_impl leaves softmax_scale at its default 1/sqrt(q.shape[-1]),
         # which for MLA is 1/sqrt(dn + dr) -- the full query head dim.
         attn = self.attn_impl(q, k, v)  # (b, l, H, dv)
-        return self.out_proj(attn.reshape(b, l, H * dv))  # (b, l, d)
+        attn = attn.reshape(b, l, H * dv)                 # (b, l, H*dv)
+        if self.use_output_gate:
+            attn = attn * torch.sigmoid(self.g_proj(x))   # (b, l, H*dv)
+        return self.out_proj(attn)  # (b, l, d)
 
 
 class TransformerBlock(nn.Module):
@@ -427,8 +437,9 @@ class TransformerBlock(nn.Module):
         norm_eps=1e-6,
         attn_impl=sdpa_math_attention,
         use_attn_res=False,
-        situ_beta=1.0,
-        situ_linear_beta=None,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+        mla_use_output_gate=True,
     ):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=norm_eps)
@@ -443,6 +454,7 @@ class TransformerBlock(nn.Module):
             weight_init_constant=weight_init_constant,
             norm_eps=norm_eps,
             attn_impl=attn_impl,
+            use_output_gate=mla_use_output_gate,
         )
         self.norm2 = RMSNorm(hidden_size, eps=norm_eps)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -586,8 +598,9 @@ class IMFDiTVideo(nn.Module):
         attn_impl=sdpa_math_attention,
         eval_mode=False,
         attn_res_block_size=0,
-        situ_beta=1.0,
-        situ_linear_beta=None,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+        mla_use_output_gate=True,
     ):
         super().__init__()
         self.head_dim = hidden_size // num_heads
@@ -714,6 +727,7 @@ class IMFDiTVideo(nn.Module):
             use_attn_res=attn_res_block_size > 0,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            mla_use_output_gate=mla_use_output_gate,
         )
         self.shared_blocks = nn.ModuleList(
             [TransformerBlock(**block_kwargs) for _ in range(shared_depth)]

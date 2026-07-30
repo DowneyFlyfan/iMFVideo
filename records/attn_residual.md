@@ -94,3 +94,9 @@ dy = einsum("nj,njd->nd", dp, v) \
 - Batch 8 without accumulation OOMs on 16 GB with the eager op (it stores the RMS-normed stack, scores and probabilities in the autograd graph per apply) and fits with the Triton op (saves only the candidate stack and the fused direction): +32% throughput over the eager configuration that fits.
 
 - Absolute samples/s are not comparable across sessions on this desktop: concurrent CPU load from unrelated jobs (load average 13-16 during these probes) shifts the partly CPU-bound training loop; the earlier eager training run logged 10.6 samples/s at lower background load. Within-session A/B: Triton 7.3-7.4 vs eager 6.4-6.6 samples/s over 100 real `train.py` steps, GPU clocks pinned at 2790-2850 MHz (no thermal throttling).
+
+## Kimi-K3 op alignment sweep (full-repo study)
+
+- Adopted: SituAndMul production parameters beta = 4.0, linear_beta = 25.0 (config.json activation_situ_beta/_linear_beta); rms_norm_eps 1e-6 -> 1e-5; MLA output gate (mla_use_output_gate = true): attn output modulated by sigmoid(g_proj(x)) before the output projection (+19.9M params -> 288.9M, cap 300M). MLP structure was already identical to KimiMLP's situ branch (cat gate/up -> SituAndMul -> down). All mirrored in the Triton MLA block JVP kernel (gate GEMM + fused sigmoid-gate JVP elementwise kernel); 18/18 tests.
+
+- Deliberately NOT adopted: NoPE in MLA (mla_use_nope; Kimi K3 gets position from the interleaved KDA linear-attention layers -- an all-MLA bidirectional DiT has no other position source, partial RoPE kept); per-head q/k nope-band RMSNorm, zero-init residual vector gates and scaled-variance init (iMF DiT recipe, not variants of Kimi ops); KDA, MoE, causal masking, KV cache, YaRN mscale (not applicable to a bidirectional video DiT). Kimi RMSNorm is mathematically identical to ours (same fp32 math and cast order). Kimi attn_res_block_size = 12 at their depth; ours stays 4 at depth 19.

@@ -469,6 +469,33 @@ def _swiglu_row_jvp(gu, dgu, h, dh, n_rows, f, beta=1.0):
 
 
 # --------------------------------------------------------------------------
+# MLA output-gate JVP (Kimi-K3 mla_use_output_gate), in place on the
+# attention output buffer:
+#   a_new  = a * sigmoid(z)
+#   da_new = da * sigmoid(z) + a * sigmoid(z) * (1 - sigmoid(z)) * dz
+# --------------------------------------------------------------------------
+@triton.jit
+def _out_gate_jvp_kernel(A, DA, Z, DZ, total, BLOCK: tl.constexpr,
+                         CLAMP: tl.constexpr):
+    # A/DA: (total,) primal/tangent attention output (modified in place)
+    # Z/DZ: (total,) primal/tangent gate pre-activations
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)   # flat element index
+    mask = i < total
+    a = tl.load(A + i, mask=mask, other=0.0).to(tl.float32)
+    da = tl.load(DA + i, mask=mask, other=0.0).to(tl.float32)
+    z = tl.load(Z + i, mask=mask, other=0.0).to(tl.float32)
+    dz = tl.load(DZ + i, mask=mask, other=0.0).to(tl.float32)
+    sig = tl.sigmoid(z)
+    out = a * sig
+    dout = da * sig + a * sig * (1.0 - sig) * dz
+    if CLAMP:
+        out = tl.clamp(out, -448.0, 448.0)
+        dout = tl.clamp(dout, -448.0, 448.0)
+    tl.store(A + i, out.to(A.dtype.element_ty), mask=mask)
+    tl.store(DA + i, dout.to(DA.dtype.element_ty), mask=mask)
+
+
+# --------------------------------------------------------------------------
 # Fused gated final add:  y = res + dwn * g   (fp32 out, both halves in one
 # launch; avoids the fp32 temporary that `res + dwn * g` in torch would
 # materialize for the product).
@@ -561,7 +588,7 @@ def _mla_fused_weights(p):
         w_gate_up (2 * F, d)         F padded to a multiple of 16
         w_down    (d, F)
     """
-    return {
+    out = {
         "w_a": torch.cat([p["w_qa"], p["w_kva"]], dim=0),
         "w_qb": p["w_qb"],
         "w_kvb": p["w_kvb"],
@@ -571,6 +598,9 @@ def _mla_fused_weights(p):
         ),
         "w_down": _pad_cols_128(p["w_down"]),
     }
+    if p.get("w_og") is not None:
+        out["w_og"] = p["w_og"]            # (H*dv, d) MLA output gate
+    return out
 
 
 def _mla_fp8_cache(p):
@@ -725,6 +755,17 @@ def _mla_chunk(x, dx, params, rope_cos, rope_sin, eps, variant, out_y, out_dy):
                attn[:B].view(B, S, H, dv),
                attn[B:].view(B, S, H, dv), scale)
 
+    # ---- Kimi MLA output gate: attn *= sigmoid(n1 @ w_og^T) ----
+    # z[m, j] = sum_k n1[m, k] * w_og[j, k]          (einsum "mk,jk->mj")
+    if "w_og" in w:
+        z = mm(xs.view(M, D), "w_og")                # (M, H*dv) fp16
+        tot = half * H * dv
+        BLKG = 1024
+        _out_gate_jvp_kernel[(triton.cdiv(tot, BLKG),)](
+            attn[:B], attn[B:], z, z[half:], tot,
+            BLOCK=BLKG, CLAMP=variant == "fp8", num_warps=4,
+        )
+
     # ---- out projection + gated residual + RMSNorm2 (fused kernel) ----
     # proj[m, j] = sum_k attn[m, k] * w_out[j, k]    (einsum "mk,jk->mj")
     proj = mm(attn.view(M, H * dv), "w_out").view(2 * B, S, D)
@@ -787,6 +828,8 @@ def mla_params_from_block(block):
         "w_down": block.mlp.w2.weight.detach(),        # (d, F0)
         "g_mlp": block.mlp_scale.detach(),             # (d,)
         "situ_beta": getattr(getattr(block.mlp, "act", None), "beta", 1.0),
+        "w_og": (attn.g_proj.weight.detach()
+                 if getattr(attn, "use_output_gate", False) else None),
         "H": attn.num_heads,
         "dq": attn.q_lora_rank,
         "dc": attn.kv_lora_rank,

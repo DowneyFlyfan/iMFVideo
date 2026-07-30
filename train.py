@@ -149,6 +149,7 @@ def build_model():
         attn_res_block_size=m.attn_res_block_size,
         situ_beta=m.situ_beta,
         situ_linear_beta=m.situ_linear_beta,
+        mla_use_output_gate=m.mla_use_output_gate,
     )
     num_params = sum(p.numel() for p in net.parameters())
     assert (
