@@ -26,6 +26,8 @@ Weight caches (fp16) must be rebuilt after every optimizer step:
 build_fast_jvp_state(net) does one pass over the blocks.
 """
 
+import gc
+
 import torch
 import triton
 
@@ -284,4 +286,9 @@ def model_du_dt_fast(net, state, x, t, h, w_cfg, t_min, t_max, y, v_c):
                          dn_[:b_], dn_[b_:], d_, d_, d_, eps, b_ * n_)
     # tangent of the linear: einsum("bnd,od->bno", dnorm_t, W)
     du_seq = torch.einsum("bnd,od->bno", dn_[b_:], lw.float())
-    return net.unpatchify(du_seq)                    # (b, C, T, Hh, Ww)
+    out = net.unpatchify(du_seq)                     # (b, C, T, Hh, Ww)
+    # torch.func.jvp closures form reference cycles that pin the whole
+    # (b, l, d) dual chain (~5 GiB at 29k tokens) until Python GC runs;
+    # collect eagerly so the backward pass has the memory.
+    gc.collect()
+    return out

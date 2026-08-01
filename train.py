@@ -150,6 +150,7 @@ def build_model():
         situ_beta=m.situ_beta,
         situ_linear_beta=m.situ_linear_beta,
         mla_use_output_gate=m.mla_use_output_gate,
+        grad_checkpoint=m.grad_checkpoint,
     )
     num_params = sum(p.numel() for p in net.parameters())
     assert (

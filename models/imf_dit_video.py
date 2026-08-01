@@ -122,15 +122,21 @@ class SituAndMul(nn.Module):
         self.beta = beta
         self.linear_beta = linear_beta
 
-    def forward(self, x):
-        # x: (..., 2F) rows [gate | up];  returns (..., F)
-        d = x.shape[-1] // 2
-        gate = x[..., :d].to(torch.float32)              # (..., F)
-        up = x[..., d:].to(torch.float32)                # (..., F)
+    def forward(self, x, up=None):
+        # x: (..., 2F) rows [gate | up], or gate (..., F) when `up` given.
+        # returns (..., F)
+        if up is None:
+            d = x.shape[-1] // 2
+            gate, up = x[..., :d], x[..., d:]            # (..., F) each
+        else:
+            gate = x                                     # (..., F)
+        dtype = gate.dtype
+        gate = gate.to(torch.float32)
+        up = up.to(torch.float32)
         situ_a = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
         if self.linear_beta is not None:
             up = self.linear_beta * torch.tanh(up / self.linear_beta)
-        return (situ_a * up).to(x.dtype)
+        return (situ_a * up).to(dtype)
 
 
 class SwiGLUMlp(nn.Module):
@@ -150,8 +156,9 @@ class SwiGLUMlp(nn.Module):
 
     def forward(self, x):
         # x: (b, l, d) -> gate/up (b, l, F) each -> (b, l, d)
-        gu = torch.cat([self.w1(x), self.w3(x)], dim=-1)   # (b, l, 2F)
-        return self.w2(self.act(gu))
+        # (no cat: at 29k tokens the (b, l, 2F) fp32 concat is a 0.65 GB
+        # transient; SituAndMul takes the pair directly)
+        return self.w2(self.act(self.w1(x), self.w3(x)))
 
 
 class TimestepEmbedder(nn.Module):
@@ -601,12 +608,15 @@ class IMFDiTVideo(nn.Module):
         situ_beta=4.0,
         situ_linear_beta=25.0,
         mla_use_output_gate=True,
+        grad_checkpoint=False,
     ):
         super().__init__()
         self.head_dim = hidden_size // num_heads
         # Kimi-K3 attention residual: snapshot the residual stream every
         # attn_res_block_size blocks; 0 disables the mechanism entirely.
         self.attn_res_block_size = attn_res_block_size
+        # recompute sublayer activations in backward (long-sequence training)
+        self.grad_checkpoint = grad_checkpoint
 
         # MLA defaults, all derived from head_dim so that
         #   qk_nope_head_dim + qk_rope_head_dim == v_head_dim == head_dim,
@@ -647,10 +657,12 @@ class IMFDiTVideo(nn.Module):
         self.eval_mode = eval_mode
 
         patch_t, patch_h, patch_w = patch_size
+        # input_size: int (square) or (H, W) tuple of latent spatial dims
+        in_h, in_w = (input_size, input_size) if isinstance(input_size, int)             else input_size
         self.grid_size = (
             num_frames // patch_t,
-            input_size // patch_h,
-            input_size // patch_w,
+            in_h // patch_h,
+            in_w // patch_w,
         )
         num_patches = self.grid_size[0] * self.grid_size[1] * self.grid_size[2]
 
@@ -822,10 +834,12 @@ class IMFDiTVideo(nn.Module):
     def _run_attn_res_blocks(self, prefix, snaps, blocks, start_idx):
         """Run blocks under the Kimi-K3 attention-residual schedule.
 
-        Mirrors KimiDecoderLayer._forward_attn_residual: before each
-        sublayer the residual stream is re-mixed by a 1-query softmax over
-        its snapshots; every attn_res_block_size blocks the prefix sum is
-        snapshotted and the running sum restarts from the sublayer output.
+        Mirrors KimiDecoderLayer._forward_attn_residual (see the record).
+        With grad_checkpoint, each block iteration runs as ONE functional
+        checkpoint segment (inputs: prefix + snapshot tensors), so neither
+        the sublayer activations nor the attention-residual candidate
+        stacks are retained for backward -- essential at 29k-token
+        sequences, where one stacked (n, J, d) candidate copy is ~0.7 GB.
 
         Args:
             prefix: (b, l, d) running residual prefix sum entering blocks.
@@ -842,30 +856,67 @@ class IMFDiTVideo(nn.Module):
         eps = self.rmsnorm_eps
         snaps = list(snaps)
         for j, block in enumerate(blocks):
-            i = start_idx + j
-            # ---- pre-attention re-mix (skipped while no snapshots exist)
-            if snaps:
-                h_in = attn_res_apply(
-                    prefix, snaps, block.attn_res_norm.weight,
-                    block.attn_res_proj.weight, eps,
-                )                                     # (b, l, d)
+            fresh = (start_idx + j) % bs == 0
+
+            def step(prefix, *snaps_t, blk=block, fr=fresh):
+                # prefix (b,l,d); snaps_t: tuple of (b,l,d) snapshots
+                snl = list(snaps_t)
+                if snl:
+                    h1 = attn_res_apply(
+                        prefix, snl, blk.attn_res_norm.weight,
+                        blk.attn_res_proj.weight, eps,
+                    )                                 # (b, l, d) remixed
+                else:
+                    h1 = prefix
+                a = blk.attn(
+                    blk.norm1(h1), self.rope_cos, self.rope_sin
+                ) * blk.attn_scale                    # (b, l, d) gated attn
+                if fr:
+                    snl2 = snl + [prefix]             # snapshot pre-block sum
+                    p2 = a                            # prefix restart
+                else:
+                    snl2 = snl
+                    p2 = prefix + a
+                h2 = attn_res_apply(
+                    p2, snl2, blk.mlp_res_norm.weight,
+                    blk.mlp_res_proj.weight, eps,
+                )                                     # (b, l, d) remixed
+                m = blk.mlp(blk.norm2(h2)) * blk.mlp_scale
+                return p2 + m                         # (b, l, d)
+
+            args = (prefix, *snaps)
+            if self.grad_checkpoint and torch.is_grad_enabled():
+                new_prefix = torch.utils.checkpoint.checkpoint(
+                    step, *args, use_reentrant=False
+                )
             else:
-                h_in = prefix
-            fresh = i % bs == 0
+                new_prefix = step(*args)
             if fresh:
-                snaps.append(prefix)                  # snapshot pre-block sum
-            a_out = block.attn(
-                block.norm1(h_in), self.rope_cos, self.rope_sin
-            ) * block.attn_scale                      # (b, l, d) gated attn
-            prefix = a_out if fresh else prefix + a_out
-            # ---- pre-MLP re-mix (snaps is non-empty from block 0 on)
-            h_in = attn_res_apply(
-                prefix, snaps, block.mlp_res_norm.weight,
-                block.mlp_res_proj.weight, eps,
-            )                                         # (b, l, d)
-            m_out = block.mlp(block.norm2(h_in)) * block.mlp_scale
-            prefix = prefix + m_out                   # (b, l, d)
+                snaps = snaps + [prefix]
+            prefix = new_prefix
         return prefix, snaps
+
+    def _out_res_apply(self, prefix, snaps, gain_mod, proj_mod):
+        """Output-side attention residual, checkpointed under grad_checkpoint.
+
+        Args:
+            prefix: (b, l, d) final prefix sum;  snaps: list of (b, l, d).
+            gain_mod: RMSNorm module;  proj_mod: Linear(d, 1) module.
+
+        Returns:
+            (b, l, d) remixed stream.
+        """
+        def apply(prefix, *snaps_t):
+            return attn_res_apply(
+                prefix, list(snaps_t), gain_mod.weight, proj_mod.weight,
+                self.rmsnorm_eps,
+            )
+
+        if self.grad_checkpoint and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(
+                apply, prefix, *snaps, use_reentrant=False
+            )
+        return apply(prefix, *snaps)
 
     def forward(self, x, t, h, w, t_min, t_max, y):
         """
@@ -894,30 +945,36 @@ class IMFDiTVideo(nn.Module):
             u_prefix, u_snaps = self._run_attn_res_blocks(
                 prefix, snaps, self.u_heads, shared_depth
             )
-            u_seq = attn_res_apply(
-                u_prefix, u_snaps, self.u_out_res_norm.weight,
-                self.u_out_res_proj.weight, self.rmsnorm_eps,
+            u_seq = self._out_res_apply(
+                u_prefix, u_snaps, self.u_out_res_norm, self.u_out_res_proj
             )
             if len(self.v_heads) > 0:
                 v_prefix, v_snaps = self._run_attn_res_blocks(
                     prefix, snaps, self.v_heads, shared_depth
                 )
-                v_seq = attn_res_apply(
-                    v_prefix, v_snaps, self.v_out_res_norm.weight,
-                    self.v_out_res_proj.weight, self.rmsnorm_eps,
+                v_seq = self._out_res_apply(
+                    v_prefix, v_snaps, self.v_out_res_norm, self.v_out_res_proj
                 )
             else:
                 v_seq = u_seq
         else:
+            def run_block(blk, z):
+                if self.grad_checkpoint and torch.is_grad_enabled():
+                    return torch.utils.checkpoint.checkpoint(
+                        lambda zz: blk(zz, self.rope_cos, self.rope_sin),
+                        z, use_reentrant=False,
+                    )
+                return blk(z, self.rope_cos, self.rope_sin)
+
             for block in self.shared_blocks:
-                seq = block(seq, self.rope_cos, self.rope_sin)
+                seq = run_block(block, seq)
 
             u_seq = v_seq = seq
             for block in self.u_heads:
-                u_seq = block(u_seq, self.rope_cos, self.rope_sin)
+                u_seq = run_block(block, u_seq)
 
             for block in self.v_heads:
-                v_seq = block(v_seq, self.rope_cos, self.rope_sin)
+                v_seq = run_block(block, v_seq)
 
         u_tokens = u_seq[:, self.prefix_tokens :]
         v_tokens = v_seq[:, self.prefix_tokens :]

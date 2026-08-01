@@ -65,6 +65,10 @@ class ModelConfig:
     # 1-query softmax over the snapshots re-mixes the stream. 0 disables.
     attn_res_block_size: int = 4
 
+    # Recompute sublayer activations in backward: required for full-latent
+    # (29k-token) sequences on 16 GB; costs ~30% extra forward compute.
+    grad_checkpoint: bool = True
+
     # Drops the v-heads; only valid for sampling, never for training.
     eval_mode: bool = False
 
@@ -76,10 +80,11 @@ class DataConfig:
     # Latent source: directory of .pt/.npy latent tensors (C,T,H,W) or "synthetic".
     # Wan-Syn parquet on the Nautilus PVC: preprocess to tensors first (see
     # fastvideo preprocessing) or point latent_dir at the converted output.
-    latent_dir: str = "synthetic"
-    latent_frames: int = 3  # latent T (video frames = 4*(T-1)+1)
-    latent_size: int = 16  # latent H = W
-    batch_size_per_gpu: int = 8
+    latent_dir: str = ".cache/wan_syn_full"
+    latent_frames: int = 20  # latent T (video frames = 4*(T-1)+1)
+    # latent spatial dims: int (square) or (H, W); Wan-Syn 480p = (56, 104)
+    latent_size: tuple = (56, 104)
+    batch_size_per_gpu: int = 1
     num_workers: int = max(0, (os.cpu_count() or 1) - 2)
     pin_memory: bool = True
 
