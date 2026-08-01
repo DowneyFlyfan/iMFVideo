@@ -63,3 +63,13 @@
 - Constant-lr plateau reached around step 4400-6000 (last windows 0.286-0.311 for five nodes); manual decay 5e-4 -> 3e-4 -> 2e-4 moved the floor only marginally (0.280 -> 0.270). Best last-window loss_u so far: 0.270 at step 6400. The remaining oscillation is the objective/data noise floor of the 56-video crop set under the adaptive-weighted iMF loss.
 
 - Curve: `records/autotrain_continuous_loss.png`; raw series `records/autotrain_continuous_history.json`. Chain continues; checkpoints in `.cache/autotrain_ckpt/` (latest two kept).
+
+## Retrain node N01: WSD scheduler + fast Triton du/dt engine
+
+- Fresh init, 400 steps, same data/seed/harness as node 05 (micro-batch 4 x grad_accum 2, lr 5e-4, wd 0.1, warmup 40). Changes vs node 05: WSD schedule (flat 5e-4 to step 340, 1-sqrt tail) instead of cosine; du/dt from the detached hand-rolled Triton forward-mode pass (models/mla_jvp_fast, jvp_impl="fast") instead of torch.func.jvp.
+
+- loss_u windows: 1.1251 / 0.7124 / 0.5918 / 0.5040; 210-400 mean 0.5479 vs node 05's 0.5222 (seed-replica spread for this metric is ~0.05: node 10 gave 0.5691 on the node-05 config); spikes 8 = same; 10.4 samples/s = same as node 05 under comparable background load.
+
+- Probe-harness effect of the fast engine alone (batch 8, loss step incl. backward): 502 -> 400 ms (-20%), peak memory 14.07 -> 9.95 GiB (-29%). Batch 8 with the optimizer resident still OOMs on 16 GB (14.95 GiB), so the node ran the accumulation harness.
+
+- du/dt rel error of the fast pass vs torch.func.jvp: 3.6e-4 (randomized heads); loss values match to 4 decimals at init; 20 passed / 2 skipped across kernel suites.
