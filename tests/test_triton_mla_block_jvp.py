@@ -76,7 +76,8 @@ def block32():
     return make_block(dtype=torch.float32)
 
 
-@pytest.mark.parametrize("variant,tol", [("fp16", 3e-3), ("fp8", 4e-2)])
+@pytest.mark.parametrize("variant,tol",
+                         [("fp16", 3e-3), ("bf16", 1e-2), ("fp8", 4e-2)])
 @pytest.mark.parametrize("b,l", [(2, 512), (1, 210), (3, 384)])
 def test_matches_fp64_reference(block32, b, l, variant, tol):
     """Triton MLA block JVP vs fp64 eager reference (primal and tangent)."""
@@ -155,8 +156,9 @@ def test_speedup_fp16_2048(block32):
     assert speedup >= 14.0, f"only {speedup:.2f}x"
 
 
-def test_speedup_at_least_15x_fp16_4096(block32):
-    """fp16 variant >= 15x vs eager fp32 jvp at (1, 4096, 1024), the
+@pytest.mark.parametrize("variant", ["fp16", "bf16"])
+def test_speedup_at_least_15x_fp16_4096(block32, variant):
+    """fp16/bf16 variants >= 15x vs eager fp32 jvp at (1, 4096, 1024), the
     model-scale sequence length (b=1 keeps the eager (b, H, l, l) fp32
     score/prob buffers inside 16 GB regardless of allocator state; b=2
     is borderline and measured 18.19x in dedicated runs). Eager is
@@ -174,10 +176,10 @@ def test_speedup_at_least_15x_fp16_4096(block32):
         torch.cuda.empty_cache()
         pytest.skip("eager fp32 jvp at (1, 4096) does not fit on this GPU")
     torch.cuda.empty_cache()
-    mod = TritonMLABlockJVP(block32, variant="fp16")
+    mod = TritonMLABlockJVP(block32, variant=variant)
     t_triton = _bench(lambda: mod(x, dx, cos, sin))
     speedup = t_eager / t_triton
-    print(f"\n(2, {l}, {D}) fp16: eager fp32 {t_eager:.2f} ms, "
+    print(f"\n({b}, {l}, {D}) {variant}: eager fp32 {t_eager:.2f} ms, "
           f"triton {t_triton:.3f} ms, speedup {speedup:.2f}x")
     assert speedup >= 15.0, f"only {speedup:.2f}x"
 

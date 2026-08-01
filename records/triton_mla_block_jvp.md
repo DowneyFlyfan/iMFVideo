@@ -112,3 +112,13 @@ $$
 - `models/triton_mla_block_jvp.py` — kernels + `triton_mla_block_jvp` + `TritonMLABlockJVP` + `mla_params_from_block`
 
 - `tests/test_triton_mla_block_jvp.py` — correctness, wrapper, speed tests; `__main__` benchmark
+
+## bf16 variant
+
+- `variant="bf16"`: bf16 weights + bf16 inter-GEMM activations; GEMM tiles are cast bf16 -> fp16 in-register for fp16-accumulate `tl.dot` (bf16 MMA supports only fp32 accumulation at half rate on GeForce; the cast is lossless in precision -- bf16's 7-bit mantissa is a subset of fp16's 10-bit -- and safe in range for post-norm activations). The packed attention operand buffer stays fp16 (written by the fp32-math prep kernels).
+
+- Speed (eager fp32 `torch.func.jvp` baseline measured first, idle GPU): (1, 4096, 1024) 65.75 ms eager -> 3.870 ms bf16 = 16.99x (asserted >= 15x in CI); (2, 2048, 1024) 43.44 -> 3.281 ms = 13.24x (below the fp16 variant's 2.64 ms from the cast overhead and bf16 stores).
+
+- Accuracy: rel Frobenius vs fp64 eager 2.08e-04 (primal and tangent) at (2, 512, 1024) -- same class as fp16 because the shared fp16-accumulate dots dominate the rounding; the bf16 weight/activation storage contributes ~3e-5 absolute. Tests 13/13 (three shapes x three variants + wrapper + two >= 15x speed asserts).
+
+- Why the block kernel is still not in the training path: it computes primal + tangent only; training additionally needs backward through the block, which this kernel family does not provide. Training's MLA attention core is kernelized separately (CuTeDSL flash JVP forward + FA4 backward), and the attention-residual op runs its own fused Triton forward/backward/jvp.

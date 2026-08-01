@@ -119,7 +119,8 @@ def _mm16_kernel(A, W, C, M, N, K,
             w = tl.load(wp)
         else:
             w = tl.load(wp, mask=rn[:, None] < N, other=0.0)
-        acc += tl.dot(a, tl.trans(w), out_dtype=tl.float16).to(tl.float32)
+        acc += tl.dot(a.to(tl.float16), tl.trans(w.to(tl.float16)),
+                      out_dtype=tl.float16).to(tl.float32)
         ap += BK
         wp += BK
     cp = C + rm[:, None] * N + rn[None, :]           # (BM, BN) C tile ptrs
@@ -130,12 +131,13 @@ def _mm16_kernel(A, W, C, M, N, K,
                  mask=(rm[:, None] < M) & (rn[None, :] < N))
 
 
-def _mm16(a, w_nk):
-    """a (M, K) fp16 @ w_nk (N, K) fp16 -> (M, N) fp16 (A @ W^T).
+def _mm16(a, w_nk, out_dtype=torch.float16):
+    """a (M, K) fp16/bf16 @ w_nk (N, K) fp16/bf16 -> (M, N) out_dtype
+    (A @ W^T); tiles are cast to fp16 in-kernel for fp16-accumulate dots.
     K must be a multiple of 128 (largest BK); M and N are masked."""
     M, K = a.shape
     N = w_nk.shape[0]
-    c = torch.empty(M, N, device=a.device, dtype=torch.float16)
+    c = torch.empty(M, N, device=a.device, dtype=out_dtype)
     grid = lambda meta: (
         triton.cdiv(M, meta["BM"]) * triton.cdiv(N, meta["BN"]),
     )
@@ -189,7 +191,8 @@ def _mm16_gate_add_kernel(A, W, RES, G, Y, DY, M, N, K, half,
             w = tl.load(wp)
         else:
             w = tl.load(wp, mask=rn[:, None] < N, other=0.0)
-        acc += tl.dot(a, tl.trans(w), out_dtype=tl.float16).to(tl.float32)
+        acc += tl.dot(a.to(tl.float16), tl.trans(w.to(tl.float16)),
+                      out_dtype=tl.float16).to(tl.float32)
         ap += BK
         wp += BK
     nmask = rn[None, :] < N
@@ -614,6 +617,11 @@ def _mla_fp16_cache(p):
     return {k: w.detach().half() for k, w in _mla_fused_weights(p).items()}
 
 
+def _mla_bf16_cache(p):
+    """bf16 copies of the fused weights, each (N, K) bf16."""
+    return {k: w.detach().bfloat16() for k, w in _mla_fused_weights(p).items()}
+
+
 def triton_mla_block_jvp(x, dx, params, rope_cos, rope_sin, eps=1e-6,
                          variant="fp16"):
     """Forward-mode JVP of the MLA transformer block w.r.t. the input only.
@@ -636,7 +644,7 @@ def triton_mla_block_jvp(x, dx, params, rope_cos, rope_sin, eps=1e-6,
     """
     assert x.is_cuda and x.is_contiguous() and dx.is_contiguous()
     assert x.dtype == torch.float32
-    assert variant in ("fp16", "fp8")
+    assert variant in ("fp16", "bf16", "fp8")
     B = x.shape[0]                         # b
     y = torch.empty_like(x)                # (b, l, d) fp32 primal out
     dy = torch.empty_like(x)               # (b, l, d) fp32 tangent out
@@ -729,8 +737,10 @@ def _mla_chunk(x, dx, params, rope_cos, rope_sin, eps, variant, out_y, out_dy):
     qb = mm(q_lat, "w_qb")                 # (M, H*(dn+dr)) fp16
     kvb = mm(kv_lat, "w_kvb")              # (M, H*(dn+dv)) fp16
 
-    # ---- assemble packed q/k/v: (2b, l, 3, H, 64) act_dt ----
-    packed = torch.empty(2 * B, S, 3, H, hd, device=dev, dtype=act_dt)
+    # ---- assemble packed q/k/v: (2b, l, 3, H, 64) ----
+    # (fp16 for the bf16 variant: flash dots run fp16-accumulate)
+    attn_dt = torch.float16 if variant == "bf16" else act_dt
+    packed = torch.empty(2 * B, S, 3, H, hd, device=dev, dtype=attn_dt)
     so_b, so_s = packed.stride(0), packed.stride(1)
     qv = packed[:, :, 0]                  # (2b, l, H, 64) q slot view
     kv_ = packed[:, :, 1]                 # (2b, l, H, 64) k slot view
@@ -750,7 +760,7 @@ def _mla_chunk(x, dx, params, rope_cos, rope_sin, eps, variant, out_y, out_dy):
 
     # ---- fused flash-attention JVP (fp16/fp8 io, fp32 softmax stats) ----
     # o[m, h, :] = softmax_s(q[m,h,:] . k[s,h,:] * scale) @ v[s,h,:]
-    attn = torch.empty(2 * B, S, H * dv, device=dev, dtype=act_dt)
+    attn = torch.empty(2 * B, S, H * dv, device=dev, dtype=attn_dt)
     _flash_jvp(qv[:B], kv_[:B], vv[:B], qv[B:], kv_[B:], vv[B:],
                attn[:B].view(B, S, H, dv),
                attn[B:].view(B, S, H, dv), scale)
@@ -857,6 +867,8 @@ class TritonMLABlockJVP(nn.Module):
         self.params = mla_params_from_block(block)
         if variant == "fp8":
             self.params["_fp8"] = _mla_fp8_cache(self.params)
+        elif variant == "bf16":
+            self.params["_bf16"] = _mla_bf16_cache(self.params)
         else:
             self.params["_fp16"] = _mla_fp16_cache(self.params)
         # CUDA-graph cache: (b, l) -> (graph, static x/dx/y/dy buffers).
