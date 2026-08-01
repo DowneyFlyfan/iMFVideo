@@ -325,6 +325,7 @@ def main():
         data_proportion=lcfg.data_proportion,
         cfg_beta=lcfg.cfg_beta,
         class_dropout_prob=lcfg.class_dropout_prob,
+        jvp_impl=lcfg.jvp_impl,
         s_max=lcfg.cfg_s_max,
         norm_p=lcfg.norm_p,
         norm_eps=lcfg.norm_eps,
