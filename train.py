@@ -217,11 +217,26 @@ def build_optimizer(net, o, device, verbose=False):
 
 
 def lr_at(step):
+    """Learning rate at `step` under config.optim.lr_schedule.
+
+    "wsd": linear warmup -> flat at lr -> decay tail ("1-sqrt" or cosine)
+    over the final decay_fraction of total_steps, down to lr*min_lr_ratio.
+    "cosine": linear warmup -> cosine annealing to the same floor.
+    """
     o = config.optim
     if step < o.warmup_steps:
         return o.lr * step / max(1, o.warmup_steps)
-    t = (step - o.warmup_steps) / max(1, o.total_steps - o.warmup_steps)
     floor = o.lr * o.min_lr_ratio
+    if o.lr_schedule == "wsd":
+        decay_start = int(o.total_steps * (1.0 - o.decay_fraction))
+        if step < decay_start:
+            return o.lr                      # flat (stable) phase
+        x = (step - decay_start) / max(1, o.total_steps - decay_start)
+        x = min(x, 1.0)
+        if o.decay_shape == "1-sqrt":
+            return floor + (o.lr - floor) * (1.0 - math.sqrt(x))
+        return floor + 0.5 * (o.lr - floor) * (1 + math.cos(math.pi * x))
+    t = (step - o.warmup_steps) / max(1, o.total_steps - o.warmup_steps)
     return floor + 0.5 * (o.lr - floor) * (1 + math.cos(math.pi * min(t, 1.0)))
 
 

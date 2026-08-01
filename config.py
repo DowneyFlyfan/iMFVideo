@@ -159,9 +159,21 @@ class OptimConfig:
     # global L2 clip over all params concatenated (not per-tensor):
     # g <- g * min(1, grad_clip / ||g||_2)
     grad_clip: float = 1.0
+
+    # --- learning-rate schedule ---
+    # "wsd" (Warmup-Stable-Decay, trapezoidal; Moonlight/MiniCPM/DeepSeek
+    #   style): linear warmup -> FLAT at lr -> decay tail over the final
+    #   decay_fraction of total_steps.
+    # "cosine": linear warmup -> cosine annealing (the previous behavior).
+    lr_schedule: str = "wsd"
     warmup_steps: int = 1000
     total_steps: int = 100_000
-    min_lr_ratio: float = 0.1  # cosine floor = lr * min_lr_ratio
+    # fraction of total_steps spent in the final decay tail (wsd only)
+    decay_fraction: float = 0.15
+    # decay tail shape (wsd only): "1-sqrt" (Hagele et al. 2024 best) or
+    # "cosine"
+    decay_shape: str = "1-sqrt"
+    min_lr_ratio: float = 0.1  # decay floor = lr * min_lr_ratio
     grad_accum: int = 1
     fused_adamw: bool = True
 
