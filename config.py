@@ -104,6 +104,9 @@ class LossConfig:
     class_dropout_prob: float = 0.1
     norm_p: float = 1.0
     norm_eps: float = 0.01
+    # du/dt engine: "fast" = detached hand-rolled Triton forward-mode pass
+    # (requires attn_res_block_size > 0 and CUDA); "functorch" = torch.func.jvp
+    jvp_impl: str = "fast"
 
 
 @dataclass
