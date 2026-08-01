@@ -115,12 +115,10 @@ class OptimConfig:
     # "adamw": plain AdamW on every parameter.
     optimizer: str = "moonlight"
 
-    lr: float = 1e-4  # NOTE
-    # WARNING for optimizer="moonlight": Moonlight's headline finding is that
-    # weight decay is what makes Muon scale, and the paper's runs use 0.1. At
-    # 1e-5 the Muon branch is effectively undecayed and the published recipe no
-    # longer applies. Raise this to ~0.1 to follow Moonlight.
-    weight_decay: float = 1e-5  # NOTE
+    lr: float = 5e-4  # tuned: 400-step node sweep 1e-4..1e-3, 5e-4 best
+    # Moonlight recipe: weight decay 0.1 on the Muon branch. Confirmed on
+    # 400-step nodes: final-window loss_u 0.7364 (wd 0.1) vs 0.8437 (1e-5).
+    weight_decay: float = 0.1
     betas: tuple = (0.9, 0.95)  # TODO: Maybe decrease beta2 in deep stages of training
 
     # --- Muon branch (ignored when optimizer="adamw") ---
