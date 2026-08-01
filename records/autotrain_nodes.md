@@ -40,4 +40,26 @@
 | C07 | 2401-2800 | 0.362 / 0.319 | 4 |
 | C08 | 2801-3200 | 0.347 / 0.307 | 4 |
 
+| C09 | 3201-3600 | 0.335 / 0.314 | 5 |
+
+| C10 | 3601-4000 | 0.334 / 0.303 | 5 |
+
+| C11 | 4001-4400 | 0.338 / 0.290 | 7 |
+
+| C12 | 4401-4800 | 0.325 / 0.311 | 7 |
+
+| C13 | 4801-5200 | 0.342 / 0.286 | 7 |
+
+| C14 | 5201-5600 | 0.354 / 0.296 | 7 |
+
+| C15 | 5601-6000 | 0.328 / 0.280 | 7 |
+
+| C16 | 6001-6400 (lr 3e-4) | 0.320 / 0.270 | 8 |
+
+| C17 | 6401-6800 (lr 2e-4) | 0.313 / 0.272 | 9 |
+
+| C18 | 6801-7200 (lr 2e-4) | 0.316 / 0.284 | 9 |
+
+- Constant-lr plateau reached around step 4400-6000 (last windows 0.286-0.311 for five nodes); manual decay 5e-4 -> 3e-4 -> 2e-4 moved the floor only marginally (0.280 -> 0.270). Best last-window loss_u so far: 0.270 at step 6400. The remaining oscillation is the objective/data noise floor of the 56-video crop set under the adaptive-weighted iMF loss.
+
 - Curve: `records/autotrain_continuous_loss.png`; raw series `records/autotrain_continuous_history.json`. Chain continues; checkpoints in `.cache/autotrain_ckpt/` (latest two kept).
