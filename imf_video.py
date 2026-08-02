@@ -34,8 +34,12 @@ class IMFVideoLoss(nn.Module):
         # "fast": detached hand-rolled Triton forward-mode pass for du/dt
         # (models/mla_jvp_fast); "functorch": torch.func.jvp (previous path)
         jvp_impl="functorch",
+        # stratified (jittered-quantile) time sampling: same marginal law,
+        # much lower per-step loss/gradient variance at small batch
+        stratified_time=True,
     ):
         super().__init__()
+        self.stratified_time = stratified_time
         self.jvp_impl = jvp_impl
         self.net = net
         self.num_classes = num_classes
@@ -52,6 +56,25 @@ class IMFVideoLoss(nn.Module):
     #                       Schedule                      #
     #######################################################
 
+    def _strat_uniform(self, bz, device):
+        """Jittered-quantile uniform draws in (0, 1).
+
+        Marginally U(0,1) like torch.rand, but the bz draws are spread one
+        per equal-probability stratum, so any batch statistic has far lower
+        variance. Falls back to plain uniform when stratified_time is off.
+
+        Args:
+            bz: batch size B;  device: placement.
+
+        Returns:
+            (B,) float32 in (0, 1).
+        """
+        if not self.stratified_time:
+            return torch.rand(bz, device=device, dtype=torch.float32)
+        i = torch.randperm(bz, device=device).to(torch.float32)   # (B,)
+        u = (i + torch.rand(bz, device=device)) / bz              # (B,)
+        return u.clamp(1e-6, 1 - 1e-6)
+
     def logit_normal_dist(self, bz, device, dtype):
         """Draw times in (0, 1) from a logit-normal distribution.
 
@@ -62,7 +85,17 @@ class IMFVideoLoss(nn.Module):
         Returns:
             (B, 1, 1, 1, 1) times, broadcastable against (B, C, T, H, W) latents.
         """
-        rnd_normal = torch.randn(bz, 1, 1, 1, 1, device=device, dtype=dtype)
+        if self.stratified_time:
+            # Stratified draws mapped through the normal quantile function:
+            # same logit-normal marginal, far lower batch-statistic variance.
+            u = self._strat_uniform(bz, device)                  # (B,)
+            rnd_normal = (
+                torch.erfinv(2 * u - 1) * (2 ** 0.5)
+            ).reshape(bz, 1, 1, 1, 1).to(dtype)                 # (B,1,1,1,1)
+        else:
+            rnd_normal = torch.randn(
+                bz, 1, 1, 1, 1, device=device, dtype=dtype
+            )
         #   rnd_normal: (B, 1, 1, 1, 1) standard normal samples
         return torch.sigmoid(rnd_normal * self.P_std + self.P_mean)
 
@@ -84,9 +117,14 @@ class IMFVideoLoss(nn.Module):
         r = self.logit_normal_dist(bz, device, dtype)  # (B, 1, 1, 1, 1)
         t, r = torch.maximum(t, r), torch.minimum(t, r)
 
-        data_size = int(bz * self.data_proportion)
-        fm_mask = torch.arange(bz, device=device) < data_size  # (B,) bool
-        fm_mask = fm_mask.reshape(bz, 1, 1, 1, 1)  # (B, 1, 1, 1, 1)
+        # Stratified flow-matching split. A deterministic prefix rule
+        # (int(bz * data_proportion)) silently yields ZERO flow-matching
+        # samples for bz < 1/data_proportion -- at micro-batch 1 the branch
+        # never fires. The jittered-quantile rule keeps the exact prefix
+        # behaviour in expectation and gives the right proportion on
+        # average at any batch size.
+        fm_u = self._strat_uniform(bz, device)                 # (B,)
+        fm_mask = (fm_u < self.data_proportion).reshape(bz, 1, 1, 1, 1)
         r = torch.where(fm_mask, t, r)  # (B, 1, 1, 1, 1)
 
         return t, r, fm_mask
@@ -105,8 +143,10 @@ class IMFVideoLoss(nn.Module):
         Returns:
             (B, 1, 1, 1, 1) float32 guidance scales in [1, 1 + s_max].
         """
-        u = torch.rand(bz, 1, 1, 1, 1, device=device, dtype=torch.float32)
-        #   u: (B, 1, 1, 1, 1) uniform samples
+        u = self._strat_uniform(bz, device).reshape(bz, 1, 1, 1, 1)
+        #   u: (B, 1, 1, 1, 1) uniform samples (stratified when enabled);
+        #   omega is the largest single variance source in the raw loss, so
+        #   spreading it across strata matters as much as spreading t.
 
         if self.cfg_beta == 1.0:
             s = torch.exp(

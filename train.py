@@ -326,6 +326,7 @@ def main():
         cfg_beta=lcfg.cfg_beta,
         class_dropout_prob=lcfg.class_dropout_prob,
         jvp_impl=lcfg.jvp_impl,
+        stratified_time=lcfg.stratified_time,
         s_max=lcfg.cfg_s_max,
         norm_p=lcfg.norm_p,
         norm_eps=lcfg.norm_eps,
@@ -373,6 +374,11 @@ def main():
         wandb.init(project=config.run.wandb_project, config=config_as_dict())
 
     os.makedirs(config.run.out_dir, exist_ok=True)
+    # running mean of loss_u over ~20 steps: the per-step value is an average
+    # over batch_size*grad_accum samples with randomly drawn (t, r, omega),
+    # so at small per-step sample counts it is a noisy estimate of the trend.
+    loss_u_ema = None
+    ema_beta = 0.8  # ~5 logged points; log_every steps apart
     data_iter = iter(loader)
     epoch = 0
     t_log = time.time()
@@ -419,9 +425,13 @@ def main():
                 * o.grad_accum
                 / dt
             )
+            lu = dict_losses["loss_u"].item()
+            loss_u_ema = lu if loss_u_ema is None else (
+                ema_beta * loss_u_ema + (1 - ema_beta) * lu
+            )
             print(
                 f"step {step} loss={loss_sum:.4f} "
-                f"loss_u={dict_losses['loss_u'].item():.4f} "
+                f"loss_u={lu:.4f} loss_u_ema={loss_u_ema:.4f} "
                 f"loss_v={dict_losses['loss_v'].item():.4f} "
                 f"grad_norm={grad_norm.item():.3f} lr={lr:.2e} "
                 f"{imgs_s:.1f} samples/s",

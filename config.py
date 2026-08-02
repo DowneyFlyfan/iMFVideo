@@ -105,6 +105,10 @@ class LossConfig:
     # du/dt engine: "fast" = detached hand-rolled Triton forward-mode pass
     # (requires attn_res_block_size > 0 and CUDA); "functorch" = torch.func.jvp
     jvp_impl: str = "fast"
+    # Stratified (jittered-quantile) sampling of t and r: identical marginal
+    # logit-normal law, but each batch covers the whole time range, which is
+    # the dominant variance source at small per-step sample counts.
+    stratified_time: bool = True
 
 
 @dataclass
