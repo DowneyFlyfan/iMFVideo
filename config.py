@@ -37,12 +37,11 @@ class ModelConfig:
 
     # --- Feed-forward and normalization ---
     mlp_ratio: float = 8 / 3  # SwiGLU hidden = mlp_ratio * hidden_size
-    # Kimi-K3 SituAndMul activation: gate act = beta*tanh(g/beta)*sigmoid(g)
-    # (bounded SiLU; SiLU is the beta -> inf limit). situ_linear_beta also
-    # soft-clamps the up branch when set (None disables).
+
+    # FIX: KimiMLP Params
     situ_beta: float = 4.0  # Kimi-K3 production value (activation_situ_beta)
     situ_linear_beta: float | None = 25.0  # Kimi-K3 activation_situ_linear_beta
-    rmsnorm_eps: float = 1e-5  # RMSNorm epsilon (Kimi-K3 rms_norm_eps)
+    rmsnorm_eps: float = 1e-5
 
     # --- In-context conditioning token banks (prepended to the patch tokens) ---
     num_class_tokens: int = 8
@@ -60,16 +59,12 @@ class ModelConfig:
     # --- 3D axial RoPE ---
     rope_theta: float = 10000.0  # base period; angles use theta^(-2i/axis_dim)
 
-    # Kimi-K3 attention residual: every attn_res_block_size blocks the
-    # residual-stream prefix sum is snapshotted, and before each sublayer a
-    # 1-query softmax over the snapshots re-mixes the stream. 0 disables.
     attn_res_block_size: int = 4
 
-    # Recompute sublayer activations in backward: required for full-latent
-    # (29k-token) sequences on 16 GB; costs ~30% extra forward compute.
+    # FIX: Set to False in server training
     grad_checkpoint: bool = True
 
-    # Drops the v-heads; only valid for sampling, never for training.
+    # Drops the v-heads; only valid for sampling
     eval_mode: bool = False
 
     max_params: int = 300_000_000
@@ -91,12 +86,10 @@ class DataConfig:
 
 @dataclass
 class LossConfig:
-    P_mean: float = -0.4  # NOTE
-    P_std: float = 1.0  # NOTE
-    # fraction of each batch forced to r = t (flow-matching samples, fm_mask=True);
-    # the remaining 1 - data_proportion keep r < t (mean-flow samples).
-    # fm samples also bypass CFG interval gating: [t_min, t_max] = [0, 1], so the
-    # sampled cfg scale w applies at every t instead of only inside the interval.
+    P_mean: float = -0.4  # FIX: Might be different
+    P_std: float = 1.0  # FIX: Think about it
+
+    # proportion of r = t
     data_proportion: float = 0.5
     # CFG (classifier-free guidance) scale omega is drawn per sample as
     #   omega(u) = (1 + u * ((1 + s_max)^(1-beta) - 1))^(1/(1-beta)),  u ~ U(0,1)
@@ -116,13 +109,10 @@ class LossConfig:
 
 @dataclass
 class OptimConfig:
-    # "moonlight": Muon (orthogonalized momentum) on the 2-D hidden weight
-    #   matrices, AdamW on everything else -- all 1-D params (norm scales,
-    #   biases, residual gates), the embedding/token tables, the patch-embed
-    #   conv and the two output projections. See moonlight.py:split_params.
-    # "adamw": plain AdamW on every parameter.
+    # "moonlight", "adamw"
     optimizer: str = "moonlight"
 
+    # FIX: A bit higher
     lr: float = 5e-4  # tuned: 400-step node sweep 1e-4..1e-3, 5e-4 best
     # Moonlight recipe: weight decay 0.1 on the Muon branch. Confirmed on
     # 400-step nodes: final-window loss_u 0.7364 (wd 0.1) vs 0.8437 (1e-5).
@@ -133,29 +123,10 @@ class OptimConfig:
     muon_momentum: float = 0.95  # mu in M_t = mu * M_{t-1} + G_t
     muon_nesterov: bool = True  # step along G + mu * M instead of M
     muon_ns_steps: int = 5  # Newton-Schulz iterations per step
-    # Update scale is muon_lr_scale_constant * sqrt(max(n, m)), which pins the
-    # orthogonalized update's RMS at the constant for every matrix shape, making
-    # an AdamW-tuned lr transferable. 0.2 is Moonlight's value.
+
+    # FIX: Can also change to other versions of muon
     muon_lr_scale_constant: float = 0.2
-    # Newton-Schulz coefficients (a, b, c).
-    #   "per_shape": fit them to each distinct weight shape at construction time,
-    #     following Su Jianlin (https://kexue.fm/archives/10592). The quintic acts
-    #     as the scalar map sigma -> a*sigma + b*sigma^3 + c*sigma^5 and so never
-    #     sees n or m, but the singular value distribution it must map to 1 does
-    #     depend on shape (Marchenko-Pastur in the aspect ratio, with the
-    #     Frobenius-normalized values scaling as 1/sqrt(min(n,m))). Fitting per
-    #     shape cuts the residual by 1-2 orders of magnitude on non-square
-    #     matrices. Costs a few seconds of SVD + Adam once at startup.
-    #   "jordan": the fixed (3.4445, -4.7750, 2.0315) that stock Muon and
-    #     Moonlight ship, which is roughly the square-matrix, steps=5 optimum.
     muon_coeff_mode: str = "per_shape"
-    # Budget for the OFFLINE per-shape fit (ignored when muon_coeff_mode="jordan").
-    # Do not confuse muon_coeff_iters with muon_ns_steps above: ns_steps=5 is the
-    # Newton-Schulz iteration applied to every matrix on every training step,
-    # whereas coeff_iters is the outer Adam loop that solves for (kappa, x1, x2)
-    # once per distinct shape at startup. The two are nested -- the fit's loss
-    # unrolls ns_steps applications of g() -- and coeff_iters costs nothing per
-    # training step.
     muon_coeff_samples: int = 32  # random matrices SVD'd to estimate the spectrum
     # Converged: at (1024, 2730) T=5, 10000 iters reproduces 3000 bit-for-bit
     # (delta kappa = 1.8e-06, same mse 2.037e-04), while 1000 is 4x worse
@@ -177,9 +148,10 @@ class OptimConfig:
     warmup_steps: int = 1000
     total_steps: int = 100_000
     # fraction of total_steps spent in the final decay tail (wsd only)
+
+    # FIX: Decay type, steps(fraction), min lr
     decay_fraction: float = 0.15
-    # decay tail shape (wsd only): "1-sqrt" (Hagele et al. 2024 best) or
-    # "cosine"
+    # decay tail shape (wsd only): "1-sqrt" (Hagele et al. 2024 best) or "cosine"
     decay_shape: str = "1-sqrt"
     min_lr_ratio: float = 0.1  # decay floor = lr * min_lr_ratio
     grad_accum: int = 1
