@@ -70,7 +70,11 @@ class ModelConfig:
 @dataclass
 class DataConfig:
     # NOTE: To Be Tuned
-    batch_size_per_gpu: int = 5
+    # At a fixed sample budget, optimizer steps beat wider steps: bs=1 x 4000
+    # steps reaches probe 0.2772 where bs=5 x 800 steps (same 4000 samples)
+    # stalls at 0.4000, because decay_fraction buys the former 800 WSD decay
+    # steps and the latter only 160. See records/loss_curve_tuning.md (R1/R2/R3).
+    batch_size_per_gpu: int = 1
 
     # NOTE: Fix these parameters for local machines
     latent_dir: str = ".cache/wan_syn_2k_full"
@@ -143,8 +147,13 @@ class OptimConfig:
     lr_schedule: str = "wsd"
 
     # NOTE: To Be Tuned
-    warmup_steps: int = 20
-    total_steps: int = 800
+    # Tuned on the 4k-step full-latent sweep (records/loss_curve_tuning.md).
+    # Best node R1_warm100: lr 2e-3, warmup 100, 4000 steps -> probe 0.2772,
+    # ahead of the same run at warmup 400 (0.2848). lr 4e-3 diverges to NaN.
+    # decay_fraction 0.2 gives 800 decay steps, where most of the gain lands;
+    # 0.1 and 0.4 were indistinguishable in the stable phase.
+    warmup_steps: int = 100
+    total_steps: int = 4000
     decay_fraction: float = 0.2
     decay_shape: str = "1-sqrt"
     min_lr_ratio: float = 0.1  # decay floor = lr * min_lr_ratio
