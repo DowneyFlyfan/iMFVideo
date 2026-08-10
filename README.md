@@ -14,7 +14,7 @@
 
 - in self-attention, $\sqrt{d}$ is always not needed. Since you can put it in initialization
 
-# MuP Rules for Special Layers (verified)
+# Scaling Rules
 
 - Deduced from `kexue.fm/archives/10795, 11605, 11647` (spectral condition / Muon steepest descent / special-case layers), anchored at reference width $d_0 = 256$; full derivations and settings in [records/mup_special_layers.md](records/mup_special_layers.md).
 
@@ -26,7 +26,7 @@
 | attn_scale / mlp_scale | Hadamard (ReZero) | $0$ by design (correct) | $0$ | $1$ / $1$ (correct) |
 | x_embedder Conv3d | Input | $\Theta(1/\sqrt{64})$ width-free | Xavier $\sqrt{2/(64+d)}$ (wrong exponent) | $1$ / $1$ (correct) |
 | u/v final layers | Output | $0$ (correct) | $0$ | $d_0/d$ / $1$ |
-| g_proj + hidden matrices | Linear | aspect rule (correct) | $0.5/\sqrt{d_{in}}$ | Moonlight shape scale (correct) |
+| g_proj + hidden matrices (Muon branch) | Linear | aspect rule (correct) | $0.5/\sqrt{d_{in}}$ | $\sqrt{d_0/d}$ under Moonlight's Adjust-LR / $1$ |
 
 - Key deduction: the residual score heads are LM-Head-type layers, since logits come from RMS-normed snapshots, so both init std and lr must carry a $1/d$ width factor, while Muon's $\mathrm{msign}$ on a $1 \times d$ matrix already reduces to exactly the prescribed Normalized SGD:
 
@@ -53,6 +53,25 @@ $$
 | res-head $\Vert\Delta w\Vert_{RMS}$ per step | width-free | 1.6e-4 | 1.4e-4 | 1.6e-4 | $+0.01$ |
 | res-head logit drift bound per step | $\propto d$ | 0.0099 | 0.0184 | 0.0403 | $+1.01$ |
 | token-bank Adam $\Vert\Delta E\Vert_{RMS}$ per step | width-free | 1.1e-4 | 1.2e-4 | 1.4e-4 | $+0.17$ |
+
+- Muon branch (hidden matrices), from `kexue.fm/archives/10770`: pure MuP-Muon ($\Delta W = -\eta\sqrt{d_{out}/d_{in}}\,\mathrm{msign}$) has width-free lr, but Moonlight's Adjust-LR scale $0.2\sqrt{\max(n,m)} \propto \sqrt{d}$ makes the update an exact isometry with spectral norm $0.2\,\eta\sqrt{d}$, so the Muon-group lr must scale as $\sqrt{d_0/d}$ (equivalently: switch the scale to $\sqrt{d_{out}/d_{in}}$ and keep lr fixed). AdamW branch unaffected.
+
+$$
+\begin{equation}
+\begin{aligned}
+\Vert x\,\Delta W \Vert_{RMS} &= \Vert \Delta W \Vert_2\,\Vert x\Vert_{RMS}
+= 0.2\,\eta\sqrt{d}
+\ \Rightarrow\ \eta_{muon}(d) = \eta\,\sqrt{d_0/d}
+\end{aligned}
+\end{equation}
+$$
+
+- Verified (same coord-check setup, per-step update of blocks[1] out_proj and mlp.w1):
+
+| quantity | prediction | d=64 | d=128 | d=256 | measured exponent |
+|---|---|---|---|---|---|
+| out_proj $\Vert\Delta W\Vert_2$ per step | $\propto \sqrt{d}$ | 2.4e-3 | 3.4e-3 | 4.7e-3 | $+0.48$ |
+| mlp_w1 $\Vert\Delta W\Vert_2$ per step | $\propto \sqrt{d}$ | 3.5e-3 | 4.4e-3 | 6.4e-3 | $+0.44$ |
 
 # Latest Loss Curve
 

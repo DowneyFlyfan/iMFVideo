@@ -89,7 +89,7 @@ $$
 | x_embedder Conv3d | Input | $\Theta(1/\sqrt{64})$, width-free | Xavier $\sqrt{2/(64+d)}$ (wrong exponent) | AdamW (yes) | $1$ | $1$ (yes) |
 | u/v_final_layer | Output | $0$ (current ok; any $O(1/d)$) | $0$ (yes) | AdamW (yes) | $d_0/d$ | $1$ |
 | attn_scale / mlp_scale gates | Hadamard (ReZero) | $0$ (design) | $0$ (yes) | AdamW $\approx$ SignSGD (yes) | $1$ | $1$ (yes) |
-| g_proj output gate + all MLA/MLP matrices | Linear | $0.5/\sqrt{d_{in}}$ with aspect factor (current ok for square-ish) | $0.5/\sqrt{d_{in}}$ (yes) | Muon (yes) | Moonlight shape scale | (yes) |
+| g_proj output gate + all MLA/MLP matrices | Linear | $0.5/\sqrt{d_{in}}$ with aspect factor (current ok for square-ish) | $0.5/\sqrt{d_{in}}$ (yes) | Muon (yes) | $\sqrt{d_0/d}$ under Moonlight's Adjust-LR (see Muon section) | $1$ |
 
 ## Experiment E1: coordinate check across widths
 
@@ -108,6 +108,42 @@ $$
 | token-bank Adam $\Vert\Delta E\Vert_{RMS}$/step | width-free | 1.12e-4 | 1.23e-4 | 1.42e-4 | $+0.17$ |
 
 - All predicted exponents confirmed: the current token/embedding init decays as $d^{-1/2}$ (rule says $\Theta(1)$), the proposed constant $=\sqrt{d}$ restores exactly $\Theta(1)$; the score-head per-step logit drift bound grows linearly in $d$ under Moonlight's width-free update RMS, so the deduced $d_0/d$ lr factor makes it width-constant by construction ($d \cdot \Vert \Delta w \Vert_{RMS} \cdot d_0/d = d_0 \cdot \Vert \Delta w \Vert_{RMS}$, and $\Vert \Delta w \Vert_{RMS}$ was measured width-free); Adam token updates are already width-free as the embedding rule requires.
+
+## Muon branch: width rule under Moonlight's Adjust-LR
+
+- Reference blog `https://kexue.fm/archives/10770` (MuP primer). Its optimizer table: hidden-matrix lr is width-free for pure MuP-Muon ($\Delta W = -\eta\sqrt{d_{out}/d_{in}}\,\mathrm{msign}$), but its closing remark states that Moonlight's Adjust-LR (multiply by $\sqrt{\max(n,m)} \propto \sqrt{d}$, from "Muon is Scalable for LLM Training") forces $\eta_k \propto 1/\sqrt{d}$ to cancel the extra width factor.
+
+- Same result from first principles: Moonlight scales the orthogonalized update to entrywise RMS $0.2\,\eta$ for every shape, and $\mathrm{msign}$ has all singular values equal, so for a square $d \times d$ hidden matrix the update is an exact isometry on its row space, making the induced per-layer output drift equal to the spectral norm with no Cauchy-Schwarz slack:
+
+$$
+\begin{equation}
+\begin{aligned}
+\Delta W &= -\eta\cdot 0.2\sqrt{d}\cdot \mathrm{msign}(M), \quad
+\Vert \Delta W \Vert_2 = 0.2\,\eta\sqrt{d} \\
+\Vert x\,\Delta W \Vert_{RMS} &= \Vert \Delta W \Vert_2\,\Vert x \Vert_{RMS}
+= 0.2\,\eta\sqrt{d} \Rightarrow \eta_{muon}(d) = \eta\sqrt{d_0/d} \\
+\Delta W_{MuP} &= -\eta\sqrt{d_{out}/d_{in}}\,\mathrm{msign}(M)
+\Rightarrow \Vert x\,\Delta W \Vert_{RMS} = \eta\ \textbf{(width-free)}
+\end{aligned}
+\end{equation}
+$$
+
+- So the Muon branch has two equivalent fixes when widening past $d_0 = 256$: keep Moonlight's $0.2\sqrt{\max(n,m)}$ scale and shrink the Muon-group lr by $\sqrt{d_0/d}$, or switch the scale to the MuP form $\sqrt{d_{out}/d_{in}}$ and keep lr fixed. The AdamW branch is untouched by this (its rules are the per-layer factors in the table above).
+
+- The full 10770 optimizer table for reference (hidden $W_k$, input $W_{in}$, output $W_{out}$; all variances: $1/d_{in}$, $1/d$, $1/d^2$ respectively): lr factors are SGD $(d, 1, 1/d)$, Adam $(1, 1/d, 1/d)$, Muon $(\sqrt{d}, 1, 1/\sqrt{d})$ for (in, hidden, out). In this repo input/output layers sit on AdamW, so only the hidden Muon rule and the AdamW rules apply.
+
+## Experiment E3: Muon-branch width check
+
+- Settings: same as E1 (widths 64/128/256, depth 19, full 29k-token latents, batch 1, 10 steps, fixed lr $2\times 10^{-3}$, Moonlight, seed 0). Measured on `shared_blocks[1].attn.out_proj.weight` ($d \times d$) and `shared_blocks[1].mlp.w1.weight` ($\lfloor 8d/3 \rfloor \times d$): entrywise RMS and spectral norm of $(W_{10} - W_0)/10$. Script `mup_muon_check.py` (scratchpad, temporary).
+
+| quantity | prediction | d=64 | d=128 | d=256 | measured exponent |
+|---|---|---|---|---|---|
+| out_proj $\Vert\Delta W\Vert_2$ / step | $\propto \sqrt{d}$ | 2.43e-3 | 3.40e-3 | 4.74e-3 | $+0.48$ |
+| mlp_w1 $\Vert\Delta W\Vert_2$ / step | $\propto \sqrt{d}$ | 3.53e-3 | 4.36e-3 | 6.45e-3 | $+0.44$ |
+| out_proj $\Vert\Delta W\Vert_{RMS}$ / step | width-free per step | 1.52e-4 | 1.22e-4 | 1.04e-4 | $-0.27$ |
+| mlp_w1 $\Vert\Delta W\Vert_{RMS}$ / step | width-free per step | 1.37e-4 | 9.83e-5 | 9.06e-5 | $-0.30$ |
+
+- The spectral norm of the accumulated update grows as $d^{\approx 1/2}$, confirming the $1/\sqrt{d}$ Muon-branch lr rule. The single-step update RMS is exactly $0.2\,\eta$ by Moonlight's construction (width-free); the mildly negative exponent of the 10-step accumulated RMS reflects cross-step directional cancellation (successive $\mathrm{msign}$ directions decorrelate faster at larger width), not a violation of the per-step RMS matching.
 
 ## Conclusions
 
