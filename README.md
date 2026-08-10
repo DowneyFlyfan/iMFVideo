@@ -14,6 +14,10 @@
 
 - in self-attention, $\sqrt{d}$ is always not needed. Since you can put it in initialization
 
+# Latest Loss Curve
+
+![tuning_4k_loss_curves](records/tuning_4k_loss_curves.png)
+
 # Done
 
 - JVP MLA Kernel
