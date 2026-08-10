@@ -246,3 +246,101 @@ $$
 - Two different series are called "the loss curve" in this project and they disagree about the small-batch end of the ladder. The per-step training `loss_u` is an average over `batch_size * grad_accum` samples with freshly drawn $(t, r, \omega)$; halving that count makes the logged series visibly noisier (cv 0.153 at 16 samples/step to 0.402 at 2) while the model it is estimating is strictly better.
 
 - So the noisier-looking run is the better run. `train.py` already logs `loss_u_ema` next to the instantaneous value; that, or a fixed-batch probe like the one used here, is the series to judge convergence by. Judging by the raw per-step series alone selects for large batches, which this sweep shows to be the worst use of a fixed sample budget.
+
+---
+
+# Rounds R1 / R2 / R3 — 4k-step full-latent sweep (2026-08)
+
+Restarted tuning against the CLAUDE.md target of 4,000 training steps on the
+2k original (uncropped) Wan-Syn latents.
+
+## Fixed across all nodes
+
+| item | value |
+|---|---|
+| latents | `.cache/wan_syn_2k_full`, `(C=16, T=20, H=56, W=104)` = 29,138 tokens |
+| model | `hidden_size=256`, `depth=19`, `aux_head_depth=4`, `num_heads=4` → 18.6M params |
+| attention | `attn_impl="flash_jvp"` (CuTeDSL), `attn_res_block_size=4` |
+| du/dt engine | `jvp_impl="fast"` (Triton forward-mode, detached) |
+| optimizer | `moonlight` (Muon + AdamW split), `muon_coeff_mode="per_shape"` |
+| schedule | `lr_schedule="wsd"`, `decay_shape="1-sqrt"`, `min_lr_ratio=0.1` |
+| sampling | `stratified_time=True`, `stratified_interval=False` |
+| split | train 1968 files / eval 32 files, `PROBE_SEED=1234` |
+| ranking metric | frozen held-out probe `loss_u` (never raw train loss) |
+
+`probe_fin` = probe at the last logged checkpoint. `cv` = coefficient of
+variation of the train `loss_u` over the second half of the run.
+
+## R1 — batch_size_per_gpu = 1, total_steps = 4000
+
+| node | lr | warmup | probe_fin | cv | note |
+|---|---|---|---|---|---|
+| **R1_warm100** | 2e-3 | 100 | **0.2772** | 1.17 | best overall |
+| R1_lr2e3 | 2e-3 | 400 | 0.2848 | 1.33 | |
+| R1_lr1e3 | 1e-3 | 400 | 0.3462 | 1.21 | |
+| R1_base | 5e-4 | 400 | 0.5355 | 0.99 | |
+| R1_lr4e3 | 4e-3 | 400 | NaN | 0.55 | diverged |
+
+`decay_fraction=0.2` throughout → 800 decay steps.
+
+## R2 — batch_size_per_gpu = 5, total_steps = 800
+
+Same 4,000-sample budget as R1, spent as 5 samples/step x 800 steps.
+
+| node | lr | probe_fin | cv |
+|---|---|---|---|
+| R2_base | 2e-3 | 0.4000 | 0.50 |
+| R2_lr1e3 | 1e-3 | 0.7621 | 0.50 |
+
+`decay_fraction=0.2` → only 160 decay steps.
+
+## R3 — batch_size_per_gpu = 5, one-knob sweep off R2_base
+
+All eight nodes were killed by the harness early-stop rule (probe worse than
+the running best at or past the halfway mark), so all report probe at step 400.
+
+| node | knob | probe@400 | cv |
+|---|---|---|---|
+| R3_wd005 | `optim.weight_decay=0.05` | 0.5679 | 0.25 |
+| R3_decay04 | `optim.decay_fraction=0.4` | 0.5760 | 0.25 |
+| R3_decay01 | `optim.decay_fraction=0.1` | 0.5762 | 0.25 |
+| R3_wic1 | `model.weight_init_constant=1.0` | 0.5794 | 0.29 |
+| R3_pmean08 | `loss.P_mean=-0.8` | 0.5807 | 0.21 |
+| R3_dp05 | `loss.data_proportion=0.5` | 0.5971 | 0.23 |
+| R3_wic032 | `model.weight_init_constant=0.32` | 0.5977 | 0.24 |
+| R3_warm80 | `optim.warmup_steps=80` | 0.5986 | 0.24 |
+
+R2_base's own probe at step 400 was 0.5762 — inside the spread of every R3
+node. No knob moved the trajectory before the decay tail opened.
+
+## Conclusions
+
+- R2_base reached 0.4000 entirely inside its decay tail: probe 0.5762 at step
+  400, 0.5736 at step 500, then 0.4565 / 0.3966 / 0.4000 once the WSD decay
+  began at step 640. The decay phase does most of the visible learning.
+
+- That is why bs=5 loses to bs=1 at an equal sample budget. Both see 4,000
+  samples, but `decay_fraction=0.2` buys bs=1 800 decay steps and bs=5 only
+  160. The bs=5 arm is decay-starved, not knob-starved, which is why the whole
+  R3 sweep was flat.
+
+- Raising `decay_fraction` does not rescue it: R3_decay04 and R3_decay01 are
+  indistinguishable from each other and from baseline at step 400, i.e. the
+  stable phase is insensitive to how much of the run is reserved for decay.
+
+- This reproduces the step-count lever from the earlier G1/G2 comparison at the
+  same 29,138 tokens: at a fixed sample budget, buy optimizer steps, not wider
+  steps.
+
+- The stability/quality trade also reproduces and is now extreme. The best node
+  has the worst-looking train curve (cv 1.17) and the flat R3 nodes have the
+  cleanest ones (cv 0.21–0.29). The per-step train `loss_u` is an average over
+  `batch_size` samples with freshly drawn nuisances, so its cv tracks batch
+  size, not convergence. Judge by the frozen probe.
+
+- Open: the "stable AND fast-converging" target is only half met. R1_warm100
+  converges fastest but its raw train series is the noisiest of the sweep.
+  Untested middle ground: bs=1 with more than 4,000 steps, or an intermediate
+  batch size with `decay_fraction` raised to hold decay steps constant.
+
+- Curves for all 15 nodes: `records/tuning_4k_loss_curves.png`.
