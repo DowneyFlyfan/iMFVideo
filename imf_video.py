@@ -31,15 +31,36 @@ class IMFVideoLoss(nn.Module):
         # Training dynamics
         norm_p=1.0,
         norm_eps=0.01,
+        loss_v_weight=1.0,
         # "fast": detached hand-rolled Triton forward-mode pass for du/dt
         # (models/mla_jvp_fast); "functorch": torch.func.jvp (previous path)
         jvp_impl="functorch",
         # stratified (jittered-quantile) time sampling: same marginal law,
         # much lower per-step loss/gradient variance at small batch
         stratified_time=True,
+        # stratify the guidance-interval bounds t_min / t_max as well. Kept on
+        # its own flag rather than folded into stratified_time because the
+        # canonical scoring distribution of the tuning harness pins it to
+        # False; flipping it under the old flag would silently redefine every
+        # previously recorded probe score.
+        stratified_interval=False,
+        # Size of the group the strata are spread over. 0 stratifies inside the
+        # micro-batch only, which is INERT at batch size 1: one stratum spanning
+        # (0, 1) is just a uniform draw, so a memory-bound run (full latents on
+        # 16 GB force micro-batch 1) gets no variance reduction at all. Setting
+        # this to batch_size * grad_accum spreads the strata across the whole
+        # accumulation group instead, which is the quantity the optimizer step
+        # actually averages over.
+        strat_group=0,
     ):
         super().__init__()
         self.stratified_time = stratified_time
+        self.stratified_interval = stratified_interval
+        self.strat_group = strat_group
+        # One independent stratum queue per draw site: sharing a queue would
+        # lock t, omega and the flow-matching split into a fixed pattern of
+        # joint strata, changing the joint law rather than just its variance.
+        self._strat_queues = {}
         self.jvp_impl = jvp_impl
         self.net = net
         self.num_classes = num_classes
@@ -51,36 +72,74 @@ class IMFVideoLoss(nn.Module):
         self.s_max = s_max
         self.norm_p = norm_p
         self.norm_eps = norm_eps
+        self.loss_v_weight = loss_v_weight
 
     #######################################################
     #                       Schedule                      #
     #######################################################
 
-    def _strat_uniform(self, bz, device):
+    def _take_strata(self, bz, device, site):
+        """Pop bz stratum indices out of `site`'s shuffled queue of 0..G-1.
+
+        Drawing without replacement from a reshuffled 0..G-1 queue is what makes
+        the group of G consecutive samples cover every stratum exactly once,
+        even though those samples arrive over several accumulation micro-batches.
+        The marginal law of a single draw stays uniform over the strata.
+
+        Args:
+            bz: number of indices to pop (the micro-batch size B).
+            device: placement;  site: draw-site key, one queue per key.
+
+        Returns:
+            (B,) float32 stratum indices in [0, G).
+        """
+        g = self.strat_group                    # G: strata per group, from config
+        # q: (n,) int64 unconsumed stratum indices for this site, n <= G. Source:
+        # self._strat_queues, initialized empty in __init__ and refilled below.
+        q = self._strat_queues.get(site)
+        if q is None or q.numel() < bz:
+            fresh = torch.randperm(g, device=device)  # (G,) a fresh 0..G-1 shuffle
+            q = fresh if q is None else torch.cat([q, fresh])
+        # out: (B,) the popped indices;  remainder is carried to the next call.
+        out, self._strat_queues[site] = q[:bz], q[bz:]
+        return out.to(torch.float32)
+
+    def _strat_uniform(self, bz, device, site="default"):
         """Jittered-quantile uniform draws in (0, 1).
 
-        Marginally U(0,1) like torch.rand, but the bz draws are spread one
-        per equal-probability stratum, so any batch statistic has far lower
+        Marginally U(0,1) like torch.rand, but the draws are spread one per
+        equal-probability stratum, so any batch statistic has far lower
         variance. Falls back to plain uniform when stratified_time is off.
 
         Args:
-            bz: batch size B;  device: placement.
+            bz: micro-batch size B;  device: placement.
+            site: draw-site key. Only used when strat_group > B, where each
+                site keeps its own stratum queue across micro-batches.
 
         Returns:
             (B,) float32 in (0, 1).
         """
         if not self.stratified_time:
             return torch.rand(bz, device=device, dtype=torch.float32)
-        i = torch.randperm(bz, device=device).to(torch.float32)   # (B,)
-        u = (i + torch.rand(bz, device=device)) / bz              # (B,)
+        if self.strat_group and self.strat_group > bz:
+            g = self.strat_group          # G: group size, batch * grad_accum
+            # i: (B,) float32 stratum indices in [0, G), popped without
+            # replacement from this site's shuffled queue.
+            i = self._take_strata(bz, device, site)
+            u = (i + torch.rand(bz, device=device)) / g           # (B,) in (0,1)
+        else:
+            i = torch.randperm(bz, device=device).to(torch.float32)   # (B,)
+            u = (i + torch.rand(bz, device=device)) / bz              # (B,)
         return u.clamp(1e-6, 1 - 1e-6)
 
-    def logit_normal_dist(self, bz, device, dtype):
+    def logit_normal_dist(self, bz, device, dtype, site="time"):
         """Draw times in (0, 1) from a logit-normal distribution.
 
         Args:
             bz: batch size B.
             device, dtype: placement of the returned tensor.
+            site: stratum-queue key; sample_tr passes a distinct key for each
+                of the two endpoint draws so they stay independent.
 
         Returns:
             (B, 1, 1, 1, 1) times, broadcastable against (B, C, T, H, W) latents.
@@ -88,7 +147,7 @@ class IMFVideoLoss(nn.Module):
         if self.stratified_time:
             # Stratified draws mapped through the normal quantile function:
             # same logit-normal marginal, far lower batch-statistic variance.
-            u = self._strat_uniform(bz, device)                  # (B,)
+            u = self._strat_uniform(bz, device, site)            # (B,)
             rnd_normal = (
                 torch.erfinv(2 * u - 1) * (2 ** 0.5)
             ).reshape(bz, 1, 1, 1, 1).to(dtype)                 # (B,1,1,1,1)
@@ -113,8 +172,8 @@ class IMFVideoLoss(nn.Module):
                 floor(B * data_proportion) samples, which are forced to r = t and
                 so reduce to plain flow matching.
         """
-        t = self.logit_normal_dist(bz, device, dtype)  # (B, 1, 1, 1, 1)
-        r = self.logit_normal_dist(bz, device, dtype)  # (B, 1, 1, 1, 1)
+        t = self.logit_normal_dist(bz, device, dtype, "time_t")  # (B, 1, 1, 1, 1)
+        r = self.logit_normal_dist(bz, device, dtype, "time_r")  # (B, 1, 1, 1, 1)
         t, r = torch.maximum(t, r), torch.minimum(t, r)
 
         # Stratified flow-matching split. A deterministic prefix rule
@@ -123,7 +182,7 @@ class IMFVideoLoss(nn.Module):
         # never fires. The jittered-quantile rule keeps the exact prefix
         # behaviour in expectation and gives the right proportion on
         # average at any batch size.
-        fm_u = self._strat_uniform(bz, device)                 # (B,)
+        fm_u = self._strat_uniform(bz, device, "fm_split")     # (B,)
         fm_mask = (fm_u < self.data_proportion).reshape(bz, 1, 1, 1, 1)
         r = torch.where(fm_mask, t, r)  # (B, 1, 1, 1, 1)
 
@@ -143,7 +202,7 @@ class IMFVideoLoss(nn.Module):
         Returns:
             (B, 1, 1, 1, 1) float32 guidance scales in [1, 1 + s_max].
         """
-        u = self._strat_uniform(bz, device).reshape(bz, 1, 1, 1, 1)
+        u = self._strat_uniform(bz, device, "omega").reshape(bz, 1, 1, 1, 1)
         #   u: (B, 1, 1, 1, 1) uniform samples (stratified when enabled);
         #   omega is the largest single variance source in the raw loss, so
         #   spreading it across strata matters as much as spreading t.
@@ -175,8 +234,17 @@ class IMFVideoLoss(nn.Module):
             t_min, t_max: (B, 1, 1, 1, 1) guidance interval bounds. Flow-matching
             samples get the degenerate interval [0, 1], i.e. no interval gating.
         """
-        t_min = 0.5 * torch.rand(bz, 1, 1, 1, 1, device=device, dtype=dtype)
-        t_max = 0.5 + 0.5 * torch.rand(bz, 1, 1, 1, 1, device=device, dtype=dtype)
+        if self.stratified_interval:
+            # u_lo, u_hi: (B, 1, 1, 1, 1) jittered-quantile uniforms from
+            # _strat_uniform, same marginal law as torch.rand but one draw per
+            # equal-probability stratum.
+            u_lo = self._strat_uniform(bz, device, "t_min").reshape(bz, 1, 1, 1, 1)
+            u_hi = self._strat_uniform(bz, device, "t_max").reshape(bz, 1, 1, 1, 1)
+            t_min = 0.5 * u_lo.to(dtype)
+            t_max = 0.5 + 0.5 * u_hi.to(dtype)
+        else:
+            t_min = 0.5 * torch.rand(bz, 1, 1, 1, 1, device=device, dtype=dtype)
+            t_max = 0.5 + 0.5 * torch.rand(bz, 1, 1, 1, 1, device=device, dtype=dtype)
 
         t_min = torch.where(fm_mask, torch.zeros_like(t_min), t_min)
         t_max = torch.where(fm_mask, torch.ones_like(t_max), t_max)
@@ -459,7 +527,7 @@ class IMFVideoLoss(nn.Module):
         loss_v = torch.sum((v - v_g) ** 2, dim=(1, 2, 3, 4))  # (B,)
         loss_v = adp_wt_fn(loss_v)  # (B,)
 
-        loss = loss_u + loss_v  # (B,)
+        loss = loss_u + self.loss_v_weight * loss_v  # (B,)
         loss = loss.mean()  # scalar, mean over batch
 
         dict_losses = {

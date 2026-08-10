@@ -1,6 +1,10 @@
 """Smoke test for the PyTorch video imfDiT model and improved MeanFlow loss.
 
-Run: /opt/miniconda3/bin/python3 tests/test_model_pt.py
+Covers the MLA (multi-head latent attention) attention path with decoupled
+("partial") rotary position embedding, the torch.func.jvp forward-mode pass,
+the loss backward, and the sampler. Runs on CUDA, MPS (Apple Metal) or CPU.
+
+Run: python tests/test_model_pt.py [cuda|mps|cpu]
 """
 
 import os
@@ -11,13 +15,62 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 
 from imf_video import IMFVideoLoss
-from models.imf_dit_video import imf_dit_video_S
+from models.imf_dit_video import (
+    eager_math_attention,
+    imf_dit_video_S,
+    sdpa_math_attention,
+)
+
+
+def pick_device():
+    """Honour an explicit argv override, else prefer CUDA, then MPS, then CPU."""
+    if len(sys.argv) > 1:
+        return torch.device(sys.argv[1])
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def check_attention_kernels():
+    """eager_math_attention must agree with the SDPA math backend on CPU.
+
+    Shape symbols: b batch, l seq len, H heads, dk q/k head dim, dv v head dim.
+    """
+    torch.manual_seed(0)
+    b, l, H, dk, dv = 2, 7, 4, 64, 48
+    q = torch.randn(b, l, H, dk, dtype=torch.float64)  # (b, l, H, dk)
+    k = torch.randn(b, l, H, dk, dtype=torch.float64)  # (b, l, H, dk)
+    v = torch.randn(b, l, H, dv, dtype=torch.float64)  # (b, l, H, dv)
+    diff = (eager_math_attention(q, k, v) - sdpa_math_attention(q, k, v)).abs().max()
+    assert diff < 1e-5, f"eager vs sdpa mismatch: {diff}"
+    print(f"attention kernels agree (max abs diff {diff.item():.2e}), dv != dk OK")
+
+
+def check_mla_geometry(net):
+    """The rotary band must be a single shared key head and an even width."""
+    attn = net.shared_blocks[0].attn
+    assert attn.qk_head_dim == attn.qk_nope_head_dim + attn.qk_rope_head_dim
+    assert attn.qk_rope_head_dim % 2 == 0 and attn.qk_nope_head_dim % 2 == 0
+    # kv_a_proj emits the dc latent plus exactly ONE dr-wide rotary key head.
+    assert attn.kv_a_proj.weight.shape[0] == attn.kv_lora_rank + attn.qk_rope_head_dim
+    # The rope table covers only the rotary band, not the whole head vector.
+    assert net.rope_cos.shape[-1] == attn.qk_rope_head_dim // 2
+    mla = sum(p.numel() for p in attn.parameters())
+    mha = 4 * attn.hidden_size * attn.hidden_size
+    assert mla < mha, f"MLA ({mla}) should be cheaper than full-rank MHA ({mha})"
+    print(f"MLA geometry OK: dq={attn.q_lora_rank} dc={attn.kv_lora_rank} "
+          f"dn={attn.qk_nope_head_dim} dr={attn.qk_rope_head_dim} "
+          f"dv={attn.v_head_dim}; attn params {mla/mha:.3f}x MHA")
 
 
 def main():
-    assert torch.cuda.is_available(), "CUDA device required"
-    device = torch.device("cuda")
+    device = pick_device()
+    print(f"device: {device}")
     torch.manual_seed(0)
+
+    check_attention_kernels()
 
     num_classes = 10
     batch, channels, frames, height, width = 2, 16, 3, 16, 16
@@ -26,6 +79,9 @@ def main():
     num_params = sum(p.numel() for p in net.parameters())
     print(f"model params: {num_params / 1e6:.2f}M")
 
+    check_mla_geometry(net)
+
+    # latents: (B, C, T, H, W) video latents;  labels: (B,) class ids
     latents = torch.randn(batch, channels, frames, height, width, device=device)
     labels = torch.randint(0, num_classes, (batch,), device=device)
 
@@ -87,6 +143,18 @@ def main():
     for key, value in dict_losses.items():
         print(f"  {key}: {value.item():.6f}")
     print(f"finite grads on {grad_params} parameter tensors")
+
+    # --- sampler: one-step and multi-step generation ---
+    for num_steps in (1, 4):
+        z_1 = torch.randn(  # (B, C, T, H, W) initial noise at t = 1
+            batch, channels, frames, height, width, device=device
+        )
+        z_0 = loss_module.sample(z_1, labels, num_steps=num_steps, omega=2.0)
+        assert z_0.shape == z_1.shape, z_0.shape
+        assert torch.isfinite(z_0).all(), f"non-finite sample at {num_steps} steps"
+        print(f"sample({num_steps} steps) OK: {tuple(z_0.shape)} "
+              f"std={z_0.std().item():.4f}")
+
     print("ALL TESTS PASSED")
 
 

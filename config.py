@@ -11,31 +11,28 @@ import os
 @dataclass
 class ModelConfig:
     # imf_dit_video backbone. Hard cap enforced in train_8gpu.py: <= 300M params.
-    hidden_size: int = 1024
+    # NOTE: Fix these parameters
+    hidden_size: int = 256
     depth: int = 19  # total blocks = depth (shared = depth - aux_head_depth)
     aux_head_depth: int = 4  # u-head and v-head each get this many blocks
-    num_heads: int = 16  # head_dim = hidden_size / num_heads = 64 (required)
+    num_heads: int = 4  # head_dim = hidden_size / num_heads = 64 (required)
 
-    # --- Multi-head Latent Attention (MLA) geometry; 0 = derive from head_dim ---
-    # A DiT keeps no KV (key-value) cache, so MLA here is a low-rank bottleneck on
-    # the q/k/v projections (~0.68x the attention params of full-rank MHA), not a
-    # cache-compression trick. Defaults satisfy
-    #   qk_nope_head_dim + qk_rope_head_dim == v_head_dim == 64,
-    # which the flash_jvp CuTeDSL op requires.
+    # NOTE: Fix these parameters
     q_lora_rank: int = 0  # dq: query latent dim, default hidden_size // 2 = 512
     kv_lora_rank: int = 0  # dc: key/value latent dim, default hidden_size // 4 = 256
     qk_nope_head_dim: int = 0  # dn: position-free q/k channels, default 48
     qk_rope_head_dim: int = 0  # dr: rotary q/k channels (shared key head), default 16
     v_head_dim: int = 0  # dv: value head dim, default head_dim = 64
 
+    # NOTE: Fix these parameters
     patch_size: tuple = (1, 2, 2)
     in_channels: int = 16  # Wan2.1 VAE latent channels
     num_classes: int = 1000
     attn_impl: str = "flash_jvp"  # "flash_jvp" (CuTeDSL kernels) | "sdpa" (math, slow)
-    # Kimi-K3 mla_use_output_gate: attn output modulated by sigmoid(g_proj(x)).
     mla_use_output_gate: bool = True
 
     # --- Feed-forward and normalization ---
+    # NOTE: Fix these parameters
     mlp_ratio: float = 8 / 3  # SwiGLU hidden = mlp_ratio * hidden_size
 
     # FIX: KimiMLP Params
@@ -44,6 +41,7 @@ class ModelConfig:
     rmsnorm_eps: float = 1e-5
 
     # --- In-context conditioning token banks (prepended to the patch tokens) ---
+    # NOTE: Fix these parameters
     num_class_tokens: int = 8
     num_time_tokens: int = 4
     num_cfg_tokens: int = 4
@@ -54,17 +52,16 @@ class ModelConfig:
     # --- Initialization scales: weight ~ Normal(0, constant / sqrt(fan_in)) ---
     token_init_constant: float = 1.0  # learned conditioning token banks
     embedding_init_constant: float = 1.0  # timestep / label embedders
-    weight_init_constant: float = 0.32  # transformer block projections
+    # transformer block projections. Tuned on the 400-step crop node sweep
+    # (records/loss_curve_tuning.md): 0.5 beats both 0.32 and 0.2/0.7.
+    # NOTE: To Be Tuned
+    weight_init_constant: float = 0.5
 
     # --- 3D axial RoPE ---
+    # NOTE: Fix these parameters
     rope_theta: float = 10000.0  # base period; angles use theta^(-2i/axis_dim)
-
     attn_res_block_size: int = 4
-
-    # FIX: Set to False in server training
     grad_checkpoint: bool = True
-
-    # Drops the v-heads; only valid for sampling
     eval_mode: bool = False
 
     max_params: int = 300_000_000
@@ -72,25 +69,23 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    # Latent source: directory of .pt/.npy latent tensors (C,T,H,W) or "synthetic".
-    # Wan-Syn parquet on the Nautilus PVC: preprocess to tensors first (see
-    # fastvideo preprocessing) or point latent_dir at the converted output.
-    latent_dir: str = ".cache/wan_syn_full"
+    # NOTE: To Be Tuned
+    batch_size_per_gpu: int = 5
+
+    # NOTE: Fix these parameters for local machines
+    latent_dir: str = ".cache/wan_syn_2k_full"
     latent_frames: int = 20  # latent T (video frames = 4*(T-1)+1)
-    # latent spatial dims: int (square) or (H, W); Wan-Syn 480p = (56, 104)
     latent_size: tuple = (56, 104)
-    batch_size_per_gpu: int = 1
     num_workers: int = max(0, (os.cpu_count() or 1) - 2)
     pin_memory: bool = True
 
 
 @dataclass
 class LossConfig:
-    P_mean: float = -0.4  # FIX: Might be different
-    P_std: float = 1.0  # FIX: Think about it
-
-    # proportion of r = t
-    data_proportion: float = 0.5
+    # NOTE: To Be Tuned
+    P_mean: float = -0.4
+    P_std: float = 1.0
+    data_proportion: float = 0.25
     # CFG (classifier-free guidance) scale omega is drawn per sample as
     #   omega(u) = (1 + u * ((1 + s_max)^(1-beta) - 1))^(1/(1-beta)),  u ~ U(0,1)
     # (beta = 1 uses the limiting form omega = (1 + s_max)^u). Both branches map
@@ -102,60 +97,55 @@ class LossConfig:
     class_dropout_prob: float = 0.1
     norm_p: float = 1.0
     norm_eps: float = 0.01
-    # du/dt engine: "fast" = detached hand-rolled Triton forward-mode pass
-    # (requires attn_res_block_size > 0 and CUDA); "functorch" = torch.func.jvp
+    loss_v_weight: float = 1.0
     jvp_impl: str = "fast"
     # Stratified (jittered-quantile) sampling of t and r: identical marginal
     # logit-normal law, but each batch covers the whole time range, which is
     # the dominant variance source at small per-step sample counts.
     stratified_time: bool = True
+    # Also stratify the guidance-interval bounds t_min / t_max. Separate flag:
+    # the tuning harness pins this to False inside its canonical scoring
+    # distribution, so folding it into stratified_time would redefine every
+    # recorded probe score.
+    stratified_interval: bool = False
+    # Spread the strata over batch_size_per_gpu * grad_accum samples instead of
+    # over one micro-batch. Set automatically at that value when
+    # strat_group_auto is on; within-micro-batch stratification is inert at
+    # micro-batch 1, which is what full uncropped latents force on 16 GB.
+    strat_group_auto: bool = False
 
 
 @dataclass
 class OptimConfig:
-    # "moonlight", "adamw"
     optimizer: str = "moonlight"
-
-    # FIX: A bit higher
-    lr: float = 5e-4  # tuned: 400-step node sweep 1e-4..1e-3, 5e-4 best
-    # Moonlight recipe: weight decay 0.1 on the Muon branch. Confirmed on
-    # 400-step nodes: final-window loss_u 0.7364 (wd 0.1) vs 0.8437 (1e-5).
+    # NOTE: Fix these parameters
+    lr: float = 2e-3
     weight_decay: float = 0.1
+
+    # NOTE: Fix these parameters for local machines
     betas: tuple = (0.9, 0.95)  # TODO: Maybe decrease beta2 in deep stages of training
 
     # --- Muon branch (ignored when optimizer="adamw") ---
-    muon_momentum: float = 0.95  # mu in M_t = mu * M_{t-1} + G_t
+    # NOTE: To Be Tuned
+    muon_momentum: float = 0.9
+
+    # NOTE: Fix these parameters for local machines
     muon_nesterov: bool = True  # step along G + mu * M instead of M
     muon_ns_steps: int = 5  # Newton-Schulz iterations per step
-
-    # FIX: Can also change to other versions of muon
     muon_lr_scale_constant: float = 0.2
     muon_coeff_mode: str = "per_shape"
     muon_coeff_samples: int = 32  # random matrices SVD'd to estimate the spectrum
-    # Converged: at (1024, 2730) T=5, 10000 iters reproduces 3000 bit-for-bit
-    # (delta kappa = 1.8e-06, same mse 2.037e-04), while 1000 is 4x worse
-    # (8.4e-04). Su's reference used 100k momentum-SGD steps at lr=0.01; Adam
-    # needs far fewer.
     muon_coeff_iters: int = 3000  # Adam iterations for the (kappa, x1, x2) fit
     muon_coeff_lr: float = 2e-2  # Adam learning rate for that fit
     muon_coeff_seed: int = 0  # RNG seed, so the coefficients are reproducible
-    # global L2 clip over all params concatenated (not per-tensor):
-    # g <- g * min(1, grad_clip / ||g||_2)
     grad_clip: float = 1.0
 
-    # --- learning-rate schedule ---
-    # "wsd" (Warmup-Stable-Decay, trapezoidal; Moonlight/MiniCPM/DeepSeek
-    #   style): linear warmup -> FLAT at lr -> decay tail over the final
-    #   decay_fraction of total_steps.
-    # "cosine": linear warmup -> cosine annealing (the previous behavior).
     lr_schedule: str = "wsd"
-    warmup_steps: int = 1000
-    total_steps: int = 100_000
-    # fraction of total_steps spent in the final decay tail (wsd only)
 
-    # FIX: Decay type, steps(fraction), min lr
-    decay_fraction: float = 0.15
-    # decay tail shape (wsd only): "1-sqrt" (Hagele et al. 2024 best) or "cosine"
+    # NOTE: To Be Tuned
+    warmup_steps: int = 20
+    total_steps: int = 800
+    decay_fraction: float = 0.2
     decay_shape: str = "1-sqrt"
     min_lr_ratio: float = 0.1  # decay floor = lr * min_lr_ratio
     grad_accum: int = 1
@@ -169,9 +159,6 @@ class RunConfig:
     log_every: int = 50
     ckpt_every: int = 5000
     resume: str = ""  # path to checkpoint to resume from
-    # shadow weights for sampling: theta_ema <- d * theta_ema + (1 - d) * theta,
-    # averaging horizon 1 / (1 - d) = 1e4 steps. no bias correction / no ramp,
-    # so the EMA stays init-biased for roughly the first horizon. 0 disables EMA.
     ema_decay: float = 0.9999
     wandb_project: str = ""  # empty disables wandb
     master_dtype: str = "float32"  # model params dtype; attention runs bf16 inside
@@ -181,8 +168,6 @@ class RunConfig:
 class SampleConfig:
     """Inference-time knobs for IMFVideoLoss.sample (integrates t = 1 -> 0)."""
 
-    # 1 gives one-step generation, which is the point of MeanFlow; more steps
-    # trade compute for accuracy.
     num_steps: int = 1
     omega: float = 2.0  # CFG scale held fixed across steps, in [1, 1 + cfg_s_max]
     t_min: float = 0.0  # guidance interval lower bound

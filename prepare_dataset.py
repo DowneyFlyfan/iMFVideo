@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Script for computing latent datasets from ImageNet and FID statistics.
 

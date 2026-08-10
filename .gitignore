@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
+.cache/
 *.safetensors
 *.ckpt
 wandb/

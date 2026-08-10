@@ -327,9 +327,16 @@ def main():
         class_dropout_prob=lcfg.class_dropout_prob,
         jvp_impl=lcfg.jvp_impl,
         stratified_time=lcfg.stratified_time,
+        stratified_interval=lcfg.stratified_interval,
+        strat_group=(
+            config.data.batch_size_per_gpu * config.optim.grad_accum
+            if lcfg.strat_group_auto
+            else 0
+        ),
         s_max=lcfg.cfg_s_max,
         norm_p=lcfg.norm_p,
         norm_eps=lcfg.norm_eps,
+        loss_v_weight=lcfg.loss_v_weight,
     )
 
     o = config.optim
