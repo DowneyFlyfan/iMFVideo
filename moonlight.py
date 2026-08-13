@@ -482,6 +482,8 @@ def split_params(model, verbose=False):
         "_embedder",         # timestep / omega / cfg-interval embedder MLPs
         "x_embedder",        # patch-embedding Conv3d (input layer)
         "final_layer",       # u_final_layer / v_final_layer (output layers)
+        "alpha_logit",       # SLA2 (H, Mb) sparse/linear mixing gates:
+                             # Hadamard-class ratios, not a hidden subspace
     )
 
     muon_params, adamw_params = [], []

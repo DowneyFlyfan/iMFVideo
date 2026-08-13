@@ -43,6 +43,7 @@ from models.triton_mla_block_jvp import (
     mla_params_from_block,
 )
 from models.triton_attn_res_jvp import triton_attn_res_jvp
+from models.sla2_mla_jvp import route_blocks, sla2_mla_jvp
 
 __all__ = ["build_fast_jvp_state", "model_du_dt_fast"]
 
@@ -106,10 +107,28 @@ def _attn_sublayer_jvp(h, dh, p, w16, cos, sin, eps):
         CLAMP=False, num_warps=4,
     )
 
-    # o[m, h, :] = softmax_s(q . k * scale) @ v      (fused flash JVP)
     attn = torch.empty(2 * B, S, H * dv, device=dev, dtype=_FP16)
-    _flash_jvp(qv[:B], kv_[:B], vv[:B], qv[B:], kv_[B:], vv[B:],
-               attn[:B].view(B, S, H, dv), attn[B:].view(B, S, H, dv), scale)
+    if "sla2" in p:
+        # SLA2 sparse-linear attention JVP (models/sla2_mla_jvp.py):
+        # sparse branch over routed blocks + complement linear states.
+        sl = p["sla2"]  # dict: alpha (H,Mb) fp32, proj_q/proj_k (hd,hd), knobs
+        # (B, S, H, hd) fp16 packed views -> (B, H, S, hd) contiguous
+        qb, kb, vb, dqb, dkb, dvb = (
+            t.permute(0, 2, 1, 3).contiguous()
+            for t in (qv[:B], kv_[:B], vv[:B], qv[B:], kv_[B:], vv[B:])
+        )
+        lut, T = route_blocks(qb, kb, sl["topk"], sl["bq"], sl["bk"],
+                              proj_q=sl["proj_q"], proj_k=sl["proj_k"])
+        o_a, do_a = sla2_mla_jvp(qb, kb, vb, dqb, dkb, dvb, sl["alpha"],
+                                 sl["topk"], sl["bq"], sl["bk"], lut=lut, T=T)
+        # (B, H, S, dv) fp32 -> (B, S, H*dv) fp16 attn buffer
+        attn[:B] = o_a.permute(0, 2, 1, 3).reshape(B, S, H * dv).to(_FP16)
+        attn[B:] = do_a.permute(0, 2, 1, 3).reshape(B, S, H * dv).to(_FP16)
+    else:
+        # o[m, h, :] = softmax_s(q . k * scale) @ v  (fused dense flash JVP)
+        _flash_jvp(qv[:B], kv_[:B], vv[:B], qv[B:], kv_[B:], vv[B:],
+                   attn[:B].view(B, S, H, dv), attn[B:].view(B, S, H, dv),
+                   scale)
 
     # Kimi MLA output gate: attn *= sigmoid(n1 @ w_og^T), JVP fused
     if "w_og" in w16:
@@ -198,6 +217,17 @@ def build_fast_jvp_state(net):
         p["attn_res_proj"] = block.attn_res_proj.weight.detach()   # (1, d)
         p["mlp_res_norm"] = block.mlp_res_norm.weight.detach()     # (d,)
         p["mlp_res_proj"] = block.mlp_res_proj.weight.detach()     # (1, d)
+        impl = getattr(block.attn, "attn_impl", None)
+        if isinstance(impl, torch.nn.Module) and hasattr(impl, "sla2"):
+            # SLA2 attention: snapshot the routing/mixing params so the fast
+            # JVP path reproduces the training-forward attention function.
+            p["sla2"] = {
+                "alpha": torch.sigmoid(
+                    impl.sla2.alpha_logit.detach()).float(),       # (H, Mb)
+                "proj_q": impl.sla2.router.proj_q.weight.detach(), # (hd, hd)
+                "proj_k": impl.sla2.router.proj_k.weight.detach(), # (hd, hd)
+                "topk": impl.topk, "bq": impl.bq, "bk": impl.bk,
+            }
         return p, _mla_fp16_cache(p)
 
     return {

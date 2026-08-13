@@ -103,7 +103,22 @@ def build_model():
 
     m = config.model
     attn = sdpa_math_attention
-    if m.attn_impl == "flash_jvp":
+    if m.attn_impl == "sla2_jvp":
+        # SLA2 sparse-linear attention: a module factory, one stateful
+        # instance (router + alpha params) per transformer block. seq_len
+        # and num_heads are bound inside IMFDiTVideo where L is known.
+        from functools import partial
+
+        from models.sla2_attention import SLA2AttentionImpl
+
+        attn = partial(
+            SLA2AttentionImpl,
+            topk=m.sla2_topk,
+            bq=m.sla2_bq,
+            bk=m.sla2_bk,
+            alpha_init=m.sla2_alpha_init,
+        )
+    elif m.attn_impl == "flash_jvp":
         # The CuTeDSL / flash-attn kernels are CUDA-only, so importing them on a
         # Mac raises. Fall back loudly rather than crashing, so the same config
         # runs for a laptop smoke test and an H200 job.

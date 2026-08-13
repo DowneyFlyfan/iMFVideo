@@ -348,6 +348,20 @@ class MLAAttention(nn.Module):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.v_head_dim = v_head_dim
+        # attn_impl is either a plain function (q, k, v) -> o shared by all
+        # blocks, or a module factory (e.g. partial(SLA2AttentionImpl, ...))
+        # that builds a stateful per-block attention (router + alpha params);
+        # factories are instantiated here so the params register as submodules.
+        from functools import partial as _partial
+        is_factory = isinstance(attn_impl, type) or (
+            isinstance(attn_impl, _partial) and isinstance(attn_impl.func, type)
+        )
+        if is_factory:
+            assert self.qk_head_dim == v_head_dim, (
+                "SLA2 attention needs qk_head_dim == v_head_dim, got "
+                f"{self.qk_head_dim} vs {v_head_dim}"
+            )
+            attn_impl = attn_impl(self.qk_head_dim)
         self.attn_impl = attn_impl
 
         linear = partial(
@@ -723,6 +737,18 @@ class IMFDiTVideo(nn.Module):
 
         head_depth = aux_head_depth
         shared_depth = depth - head_depth
+
+        # A module-factory attn_impl (SLA2) needs the full sequence length
+        # L = prefix_tokens + num_patches and the head count to size its
+        # per-(head, query-block) alpha eagerly; bind them here where L is
+        # first known, before the blocks instantiate the factory per block.
+        from functools import partial as _partial
+        if isinstance(attn_impl, _partial) and isinstance(attn_impl.func, type):
+            attn_impl = _partial(
+                attn_impl,
+                seq_len=self.prefix_tokens + num_patches,
+                num_heads=num_heads,
+            )
 
         block_kwargs = dict(
             hidden_size=hidden_size,
