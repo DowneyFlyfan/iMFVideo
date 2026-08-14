@@ -197,9 +197,19 @@ def sla2_cube_qat_jvp(q, k, v, dq, dk, dv, alpha, topk_frac, Np, E,
         num_warps=4, num_stages=2,
     )
 
-    qphi, dqphi = _phi_jvp(q, dq)
-    kphi, dkphi = _phi_jvp(k, dk)
-    o_l, do_l = _linear_jvp(qphi, dqphi, kphi, dkphi, v, dv, lut, Np, E)
+    # linear complement branch, chunked over heads: the fp32 phi/state/
+    # einsum transients are ~1.2 GB at 29k tokens for all 4 heads at once,
+    # which tips a 16 GB card over when stacked on the training footprint.
+    o_l = torch.empty_like(o)
+    do_l = torch.empty_like(do)
+    for h0 in range(H):
+        sl = slice(h0, h0 + 1)
+        qphi, dqphi = _phi_jvp(q[:, sl], dq[:, sl])
+        kphi, dkphi = _phi_jvp(k[:, sl], dk[:, sl])
+        ol_h, dol_h = _linear_jvp(qphi, dqphi, kphi, dkphi,
+                                  v[:, sl], dv[:, sl], lut[:, sl], Np, E)
+        o_l[:, sl] = ol_h
+        do_l[:, sl] = dol_h
 
     if torch.is_tensor(alpha) and alpha.dim() == 2:
         reps = torch.tensor([E] * Np + ([P] if P else []), device=q.device)
