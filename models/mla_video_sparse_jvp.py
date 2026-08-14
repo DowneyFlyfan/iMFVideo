@@ -321,18 +321,20 @@ def _linear_jvp(qphi, dqphi, kphi, dkphi, v, dv, lut, Np, E):
 
     T = lut.shape[-1]
     idx = lut.long()                                         # (B,H,Mb,T)
-    gH = torch.gather(
-        Hb, 2, idx.view(B, H, Mb * T, 1, 1).expand(-1, -1, -1, D, Dv)
-    ).view(B, H, Mb, T, D, Dv).sum(3)                        # (B,H,Mb,D,Dv)
-    gdH = torch.gather(
-        dHb, 2, idx.view(B, H, Mb * T, 1, 1).expand(-1, -1, -1, D, Dv)
-    ).view(B, H, Mb, T, D, Dv).sum(3)
-    gz = torch.gather(
-        zb, 2, idx.view(B, H, Mb * T, 1).expand(-1, -1, -1, D)
-    ).view(B, H, Mb, T, D).sum(3)                            # (B,H,Mb,D)
-    gdz = torch.gather(
-        dzb, 2, idx.view(B, H, Mb * T, 1).expand(-1, -1, -1, D)
-    ).view(B, H, Mb, T, D).sum(3)
+    # accumulate routed-block sums one LUT entry at a time: a single
+    # (B,H,Mb*T,D,Dv) gather is ~0.8 GB at probe batch 8, T=13; the loop
+    # peaks at (B,H,Mb,D,Dv) per term with identical results.
+    gH = torch.zeros(B, H, Mb, D, Dv, device=Hb.device)      # (B,H,Mb,D,Dv)
+    gdH = torch.zeros_like(gH)
+    gz = torch.zeros(B, H, Mb, D, device=Hb.device)          # (B,H,Mb,D)
+    gdz = torch.zeros_like(gz)
+    for j in range(T):
+        ix5 = idx[..., j].view(B, H, Mb, 1, 1).expand(-1, -1, -1, D, Dv)
+        ix4 = idx[..., j].view(B, H, Mb, 1).expand(-1, -1, -1, D)
+        gH += torch.gather(Hb, 2, ix5)
+        gdH += torch.gather(dHb, 2, ix5)
+        gz += torch.gather(zb, 2, ix4)
+        gdz += torch.gather(dzb, 2, ix4)
 
     H_c = H_all.unsqueeze(2) - gH                            # (B,H,Mb,D,Dv)
     dH_c = dH_all.unsqueeze(2) - gdH
