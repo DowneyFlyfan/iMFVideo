@@ -3,23 +3,24 @@
 
 Composition per head (tokens in TILE-MAJOR order: 3D video tiles of
 `tile_elems` tokens each come first, the `prefix_len` conditioning tokens
-ride at the end as one always-attended ragged tail block):
+ride at the end as one always-attended ragged tail block). NO coarse
+branch: VSA contributes the 3D-cube blocks, SLA2 contributes the router
+and the two-branch structure:
 
-    O   = g .* O_c + a .* O_s + (1 - a) .* O_l
-    O_c = softmax(Q_c K_c^T / sqrt(D)) V_c        broadcast tile -> tokens
-    O_s = softmax(Q K^T / sqrt(D)  on {topk tiles from the coarse scores}
+    O   = a .* O_s + (1 - a) .* O_l
+    O_s = softmax(Q K^T / sqrt(D)  on {topk tiles from the router}
                                        + {prefix tail block}) V
     O_l = complement linear branch (SLA2) over the NON-selected tiles
           (prefix block excluded from the linear branch)
+    router (SLA2): mean-pool tiles, smooth-k (subtract mean key),
+        learnable proj_q / proj_k (D x D, identity init), scores
+        pool(Q) W_q (pool(K) W_k)^T / sqrt(D), hard top-k -> LUT
 
-The coarse (VSA compression) branch both contributes gated output and
-supplies the routing scores, so routing is trainable through g without a
-separate router. JVP: the hard top-k LUT is piecewise constant (zero
-tangent a.e., reused from the primal); (g, dg) and the constant a mix in
-by the product rule; the coarse branch is a small dense softmax JVP in
-torch; the sparse branch is the routed-block flash-JVP recurrence in the
-Triton kernel `_mla_video_sparse_jvp_kernel`; the linear branch is
-bilinear in per-tile states, tangents by einsum.
+JVP: the hard top-k LUT is piecewise constant (zero tangent a.e.,
+reused from the primal); the constant a mixes linearly; the sparse
+branch is the routed-block flash-JVP recurrence in the Triton kernel
+`_mla_video_sparse_jvp_kernel`; the linear branch is bilinear in
+per-tile states, tangents by einsum.
 
 Shape symbols:
     B : batch;  H : heads;  L : tokens = Np * E + P;  D : head dim (= Dv)
@@ -32,7 +33,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-__all__ = ["tile_permutation", "mla_video_sparse_jvp", "mvs_dense_ref"]
+__all__ = ["tile_permutation", "route_tiles", "mla_video_sparse_jvp",
+           "mvs_dense_ref"]
 
 _EPS_L = 1e-5  # linear-branch normalizer epsilon (matches SLA2)
 
@@ -218,50 +220,58 @@ def _sparse_jvp(q, k, v, dq, dk, dv, lut, T, E, scale, has_prefix,
 
 
 # ---------------------------------------------------------------------------
-# Coarse (VSA compression) branch JVP: pooled-tile dense attention, torch.
+# Router (SLA2): pooled 3D tiles, smooth-k, learnable projections, top-k.
 # ---------------------------------------------------------------------------
-def _pool_pair(x, dx, Np, E, prefix_cnt):
-    """Mean-pool tokens into tiles, with tangents.
+def _pool_tiles(x, Np, E, prefix_cnt):
+    """Mean-pool tokens into tiles (primal only; the hard router needs no
+    tangent).
 
     Args:
-        x, dx: (B, H, L, D) tile-major; the last block (tokens Np*E..L) is
-            the ragged prefix tail when prefix_cnt > 0.
+        x: (B, H, L, D) tile-major; tokens Np*E..L are the ragged prefix
+            tail when prefix_cnt > 0.
         Np: number of video tiles;  E: tile length.
         prefix_cnt: P tokens in the tail block (0 = no tail).
 
     Returns:
-        (xc, dxc): (B, H, Nb, D) pooled tiles, Nb = Np (+1 with prefix).
+        xc: (B, H, Nb, D) pooled tiles, Nb = Np (+1 with prefix).
     """
     B, H, L, D = x.shape
-    xf, dxf = x.float(), dx.float()
+    xf = x.float()
     xc = xf[:, :, :Np * E].view(B, H, Np, E, D).mean(3)      # (B,H,Np,D)
-    dxc = dxf[:, :, :Np * E].view(B, H, Np, E, D).mean(3)
     if prefix_cnt:
         xt = xf[:, :, Np * E:].mean(2, keepdim=True)         # (B,H,1,D)
-        dxt = dxf[:, :, Np * E:].mean(2, keepdim=True)
         xc = torch.cat([xc, xt], dim=2)                      # (B,H,Np+1,D)
-        dxc = torch.cat([dxc, dxt], dim=2)
-    return xc, dxc
+    return xc
 
 
-def _coarse_jvp(qc, dqc, kc, dkc, vc, dvc, scale):
-    """Dense softmax attention over pooled tiles, with JVP.
+def route_tiles(q, k, topk_frac, Np, E, prefix_len,
+                proj_q=None, proj_k=None):
+    """SLA2 router on VSA 3D-cube tiles: hard top-k over pooled scores.
 
     Args:
-        qc..dvc: (B, H, Nb, D) pooled tiles and tangents.
-        scale: softmax scale 1/sqrt(D).
+        q, k: (B, H, L, D) primal queries / keys, tile-major order.
+        topk_frac: fraction of the Np video tiles routed sparse.
+        Np, E, prefix_len: tiling geometry.
+        proj_q, proj_k: optional learnable (D, D) router projections
+            (identity-initialized in the SLA2 module); None = identity.
 
     Returns:
-        (oc, doc, s): (B, H, Nb, D) coarse outputs and (B, H, Nb, Nb)
-        primal scores (routing source).
+        lut: (B, H, Mb, T) int32 selected video-tile ids (Mb = Np + 1 with
+            a prefix tail, else Np).
+        T: topk count (int).
     """
-    s = (qc @ kc.transpose(-1, -2)) * scale                  # (B,H,Nb,Nb)
-    ds = (dqc @ kc.transpose(-1, -2) + qc @ dkc.transpose(-1, -2)) * scale
-    p = torch.softmax(s, dim=-1)                             # (B,H,Nb,Nb)
-    dp = p * (ds - (p * ds).sum(-1, keepdim=True))
-    oc = p @ vc                                              # (B,H,Nb,D)
-    doc = dp @ vc + p @ dvc
-    return oc, doc, s
+    qb = _pool_tiles(q, Np, E, prefix_len)                   # (B,H,Mb,D)
+    kb = _pool_tiles(k, Np, E, prefix_len)[:, :, :Np]        # (B,H,Np,D)
+    # smooth-k (SageAttention, kept from SLA/SLA2): subtract the mean key
+    kb = kb - kb.mean(2, keepdim=True)
+    if proj_q is not None:
+        qb = qb @ proj_q.t().to(qb.dtype)
+    if proj_k is not None:
+        kb = kb @ proj_k.t().to(kb.dtype)
+    pc = (qb @ kb.transpose(-1, -2)) * (q.shape[-1] ** -0.5)  # (B,H,Mb,Np)
+    T = max(1, min(Np, int(topk_frac * Np)))
+    lut = torch.topk(pc, T, dim=-1, sorted=False).indices.to(torch.int32)
+    return lut.contiguous(), T
 
 
 # ---------------------------------------------------------------------------
@@ -351,21 +361,21 @@ def _linear_jvp(qphi, dqphi, kphi, dkphi, v, dv, lut, Np, E):
 # ---------------------------------------------------------------------------
 # Full op and dense reference.
 # ---------------------------------------------------------------------------
-def mla_video_sparse_jvp(q, k, v, dq, dk, dv, gate, dgate, alpha,
+def mla_video_sparse_jvp(q, k, v, dq, dk, dv, alpha,
                          topk_frac, Np, E, prefix_len,
+                         proj_q=None, proj_k=None,
                          lut=None, T=None, block_m=64):
-    """VSA x SLA2 attention (primal, tangent) from qkv dual pairs.
+    """VSA-tiled SLA2 attention (primal, tangent) from qkv dual pairs.
 
-    Inputs are in TILE-MAJOR order (use tile_permutation): Np tiles of E
-    tokens, then prefix_len conditioning tokens as a ragged tail.
+    Inputs are in TILE-MAJOR order (use tile_permutation): Np 3D tiles of
+    E tokens, then prefix_len conditioning tokens as a ragged tail.
 
     Args:
         q, k, v / dq, dk, dv: (B, H, L, D) primal / tangent, L = Np*E + P.
-        gate, dgate: (B, H, L, 1) or scalar coarse-branch gate g and its
-            tangent (g = sigmoid(proj(x)) upstream; constant -> dgate = 0).
         alpha: (H, Mb) sparse/linear mix in (0,1), or scalar.
         topk_frac: fraction of video tiles routed (ignored when lut given).
         Np, E, prefix_len: tiling geometry.
+        proj_q, proj_k: optional learnable (D, D) SLA2 router projections.
         lut, T: optional precomputed routing (from a primal training pass).
         block_m: query rows per kernel program.
 
@@ -376,24 +386,11 @@ def mla_video_sparse_jvp(q, k, v, dq, dk, dv, gate, dgate, alpha,
     scale = D ** -0.5
     P = prefix_len
     has_prefix = P > 0
-    Mb = Np + (1 if has_prefix else 0)
 
-    # ---- coarse branch on pooled tiles (+ pooled prefix tail) ----
-    qc, dqc = _pool_pair(q, dq, Np, E, P)                    # (B,H,Nb,D)
-    kc, dkc = _pool_pair(k, dk, Np, E, P)
-    vc, dvc = _pool_pair(v, dv, Np, E, P)
-    oc_b, doc_b, s = _coarse_jvp(qc, dqc, kc, dkc, vc, dvc, scale)
-    # broadcast tile outputs back to tokens
-    reps = [E] * Np + ([P] if has_prefix else [])
-    reps = torch.tensor(reps, device=q.device)
-    oc = oc_b.repeat_interleave(reps, dim=2)                 # (B,H,L,D)
-    doc = doc_b.repeat_interleave(reps, dim=2)
-
-    # ---- routing from the coarse scores over VIDEO tiles only ----
+    # ---- SLA2 router on VSA 3D tiles (hard: no tangent) ----
     if lut is None:
-        T = max(1, min(Np, int(topk_frac * Np)))
-        lut = torch.topk(s[..., :Np], T, dim=-1,
-                         sorted=False).indices.to(torch.int32).contiguous()
+        lut, T = route_tiles(q, k, topk_frac, Np, E, P,
+                             proj_q=proj_q, proj_k=proj_k)
         #   lut: (B, H, Mb, T) selected video-tile ids per query block
 
     # ---- sparse branch over routed tiles + prefix tail ----
@@ -405,7 +402,7 @@ def mla_video_sparse_jvp(q, k, v, dq, dk, dv, gate, dgate, alpha,
     kphi, dkphi = _phi_jvp(k, dk)
     o_l, do_l = _linear_jvp(qphi, dqphi, kphi, dkphi, v, dv, lut, Np, E)
 
-    # ---- gated mix (product rule on g; a is constant) ----
+    # ---- constant-a mix ----
     if torch.is_tensor(alpha) and alpha.dim() == 2:
         a = alpha.float().repeat_interleave(
             torch.tensor([E] * Np + ([P] if has_prefix else []),
@@ -413,21 +410,16 @@ def mla_video_sparse_jvp(q, k, v, dq, dk, dv, gate, dgate, alpha,
         a = a.view(1, H, L, 1)
     else:
         a = torch.as_tensor(alpha, device=q.device, dtype=torch.float32)
-    g = gate if torch.is_tensor(gate) else torch.as_tensor(
-        gate, device=q.device, dtype=torch.float32)
-    dg = dgate if torch.is_tensor(dgate) else torch.as_tensor(
-        dgate, device=q.device, dtype=torch.float32)
-    o = g * oc + a * o_s + (1.0 - a) * o_l
-    do = dg * oc + g * doc + a * do_s + (1.0 - a) * do_l
+    o = a * o_s + (1.0 - a) * o_l
+    do = a * do_s + (1.0 - a) * do_l
     return o, do
 
 
-def mvs_dense_ref(q, k, v, gate, alpha, lut, Np, E, prefix_len):
+def mvs_dense_ref(q, k, v, alpha, lut, Np, E, prefix_len):
     """Dense fp32 reference of the fused op, differentiable, for tests.
 
     Args:
         q, k, v: (B, H, L, D) fp32, tile-major order.
-        gate: (B, H, L, 1) coarse gate.
         alpha: (H, Mb) sparse/linear mix.
         lut: (B, H, Mb, T) selected video-tile ids.
         Np, E, prefix_len: tiling geometry.
@@ -440,16 +432,6 @@ def mvs_dense_ref(q, k, v, gate, alpha, lut, Np, E, prefix_len):
     Mb, T = lut.shape[2], lut.shape[3]
     scale = D ** -0.5
     reps = torch.tensor([E] * Np + ([P] if P else []), device=q.device)
-
-    # coarse branch
-    def pool(x):
-        xc = x[:, :, :Np * E].view(B, H, Np, E, D).mean(3)
-        if P:
-            xc = torch.cat([xc, x[:, :, Np * E:].mean(2, keepdim=True)], 2)
-        return xc
-    qc, kc, vc = pool(q), pool(k), pool(v)                   # (B,H,Nb,D)
-    s = (qc @ kc.transpose(-1, -2)) * scale
-    oc = (torch.softmax(s, -1) @ vc).repeat_interleave(reps, 2)
 
     # token mask from LUT (+ always-on prefix tail, ragged)
     mc = torch.zeros(B, H, Mb, Np, device=q.device)
@@ -474,4 +456,4 @@ def mvs_dense_ref(q, k, v, gate, alpha, lut, Np, E, prefix_len):
     o_l = (w @ v) / (w.sum(-1, keepdim=True) + _EPS_L)
 
     a = alpha.repeat_interleave(reps, dim=-1).view(1, H, L, 1)
-    return gate * oc + a * o_s + (1.0 - a) * o_l
+    return a * o_s + (1.0 - a) * o_l
