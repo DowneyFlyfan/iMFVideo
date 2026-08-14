@@ -92,13 +92,16 @@ def sdpa_flash_attention(q, k, v):
     Returns:
         (batch, seq_len, num_heads, v_head_dim)
     """
-    q, k, v = (x.transpose(1, 2) for x in (q, k, v))  # -> (B, H, S, D)
+    dt = q.dtype
+    # flash kernels need fp16/bf16; the CuTeDSL flash_jvp path also runs
+    # attention in bf16 internally, so this matches production numerics.
+    q, k, v = (x.transpose(1, 2).to(torch.bfloat16) for x in (q, k, v))
     with torch.nn.attention.sdpa_kernel([
         torch.nn.attention.SDPBackend.FLASH_ATTENTION,
         torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
     ]):
-        out = F.scaled_dot_product_attention(q, k, v)
-    return out.transpose(1, 2)  # (B, S, H, Dv)
+        out = F.scaled_dot_product_attention(q, k, v)  # (B, H, S, Dv) bf16
+    return out.transpose(1, 2).to(dt)  # (B, S, H, Dv)
 
 
 #################################################################################
