@@ -63,6 +63,28 @@ from models.triton_block_jvp import (
 
 __all__ = ["triton_mla_block_jvp", "TritonMLABlockJVP", "mla_params_from_block"]
 
+# RMSNorm-JVP outputs are clamped into a safe range for the buffer dtype.
+# The tangent dy = w*(dx/r - x*mean(x*dx)/r^3) with r = sqrt(mean(x^2)+eps)
+# is amplified by up to 1/sqrt(eps) (1000x at eps=1e-6) on a row whose primal
+# norm is near zero, so a large-but-healthy tangent dx on a degenerate row
+# overflows the fp16 store (|dy| > 65504 -> inf) and every downstream stage
+# turns NaN (observed on the kv-latent norm at small model geometry).
+# 448 is the fp8 max. 4096 is orders of magnitude above healthy tangents
+# (O(10) at init) while keeping even a fully saturated row's fp16-accumulate
+# GEMM partial sums (limit * sum|w| over a <=128-wide K chunk) well below
+# the fp16 max of 65504.
+_CLAMP_FP8 = 448.0
+_CLAMP_FP16 = 4096.0
+
+
+def _norm_jvp_clamp(dtype):
+    """Clamp limit for RMSNorm-JVP outputs written to `dtype` (0 = none)."""
+    if dtype == _FP8:
+        return _CLAMP_FP8
+    if dtype in (torch.float16, torch.bfloat16):
+        return _CLAMP_FP16
+    return 0.0
+
 
 # --------------------------------------------------------------------------
 # fp16 GEMM with fp16-accumulate tiles:  c[m, n] = sum_k a[m, k] * w[n, k]
@@ -91,6 +113,7 @@ _MM16_CONFIGS = [
 def _mm16_kernel(A, W, C, M, N, K,
                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
                  EVEN_M: tl.constexpr, EVEN_N: tl.constexpr,
+                 EVEN_K: tl.constexpr,
                  GM: tl.constexpr = 8):
     # A (M, K) fp16 row-major;  W (N, K) fp16 row-major;  C (M, N) fp16
     # 1D grid with grouped block ordering (GM row-blocks per column sweep)
@@ -110,15 +133,24 @@ def _mm16_kernel(A, W, C, M, N, K,
     ap = A + rm[:, None] * K + rk[None, :]           # (BM, BK) A tile ptrs
     wp = W + rn[:, None] * K + rk[None, :]           # (BN, BK) W tile ptrs
     acc = tl.zeros([BM, BN], tl.float32)   # (BM, BN) cross-chunk accumulator
-    for _ in range(0, K, BK):              # K is a multiple of BK for all uses
-        if EVEN_M:
-            a = tl.load(ap)
+    for k0 in range(0, K, BK):
+        if EVEN_K:                         # K is a multiple of BK: no k mask
+            if EVEN_M:
+                a = tl.load(ap)
+            else:
+                a = tl.load(ap, mask=rm[:, None] < M, other=0.0)
+            if EVEN_N:
+                w = tl.load(wp)
+            else:
+                w = tl.load(wp, mask=rn[:, None] < N, other=0.0)
         else:
-            a = tl.load(ap, mask=rm[:, None] < M, other=0.0)
-        if EVEN_N:
-            w = tl.load(wp)
-        else:
-            w = tl.load(wp, mask=rn[:, None] < N, other=0.0)
+            # K < BK or not a multiple of it (small latent ranks): without
+            # the k mask the tile would read past the row end -- adjacent
+            # rows' data folded into the dot, and uninitialized memory
+            # (possibly NaN halves) past the last row of the buffer.
+            km = (k0 + rk < K)[None, :]    # (1, BK) valid-column mask
+            a = tl.load(ap, mask=km & (rm[:, None] < M), other=0.0)
+            w = tl.load(wp, mask=km & (rn[:, None] < N), other=0.0)
         acc += tl.dot(a.to(tl.float16), tl.trans(w.to(tl.float16)),
                       out_dtype=tl.float16).to(tl.float32)
         ap += BK
@@ -134,7 +166,8 @@ def _mm16_kernel(A, W, C, M, N, K,
 def _mm16(a, w_nk, out_dtype=torch.float16):
     """a (M, K) fp16/bf16 @ w_nk (N, K) fp16/bf16 -> (M, N) out_dtype
     (A @ W^T); tiles are cast to fp16 in-kernel for fp16-accumulate dots.
-    K must be a multiple of 128 (largest BK); M and N are masked."""
+    M, N and K are masked (K masking engages only when K is not a multiple
+    of 128, e.g. the small latent ranks of the q_b/kv_b up-projections)."""
     M, K = a.shape
     N = w_nk.shape[0]
     c = torch.empty(M, N, device=a.device, dtype=out_dtype)
@@ -144,6 +177,7 @@ def _mm16(a, w_nk, out_dtype=torch.float16):
     _mm16_kernel[grid](
         a, w_nk, c, M, N, K,
         EVEN_M=(M % 256 == 0), EVEN_N=(N % 256 == 0),
+        EVEN_K=(K % 128 == 0),
     )
     return c
 
@@ -163,6 +197,7 @@ def _mm16_gate_add_kernel(A, W, RES, G, Y, DY, M, N, K, half,
                           BM: tl.constexpr, BN: tl.constexpr,
                           BK: tl.constexpr,
                           EVEN_M: tl.constexpr, EVEN_N: tl.constexpr,
+                          EVEN_K: tl.constexpr,
                           GM: tl.constexpr = 8):
     # A (M, K) fp16;  W (N, K) fp16;  RES (M, N) fp16 stacked residual
     # G (N,) fp32 gate;  Y/DY (half, N) fp32 primal/tangent outputs
@@ -182,15 +217,20 @@ def _mm16_gate_add_kernel(A, W, RES, G, Y, DY, M, N, K, half,
     ap = A + rm[:, None] * K + rk[None, :]           # (BM, BK) A tile ptrs
     wp = W + rn[:, None] * K + rk[None, :]           # (BN, BK) W tile ptrs
     acc = tl.zeros([BM, BN], tl.float32)   # (BM, BN) cross-chunk accumulator
-    for _ in range(0, K, BK):
-        if EVEN_M:
-            a = tl.load(ap)
+    for k0 in range(0, K, BK):
+        if EVEN_K:                         # K is a multiple of BK: no k mask
+            if EVEN_M:
+                a = tl.load(ap)
+            else:
+                a = tl.load(ap, mask=rm[:, None] < M, other=0.0)
+            if EVEN_N:
+                w = tl.load(wp)
+            else:
+                w = tl.load(wp, mask=rn[:, None] < N, other=0.0)
         else:
-            a = tl.load(ap, mask=rm[:, None] < M, other=0.0)
-        if EVEN_N:
-            w = tl.load(wp)
-        else:
-            w = tl.load(wp, mask=rn[:, None] < N, other=0.0)
+            km = (k0 + rk < K)[None, :]    # (1, BK) valid-column mask
+            a = tl.load(ap, mask=km & (rm[:, None] < M), other=0.0)
+            w = tl.load(wp, mask=km & (rn[:, None] < N), other=0.0)
         acc += tl.dot(a.to(tl.float16), tl.trans(w.to(tl.float16)),
                       out_dtype=tl.float16).to(tl.float32)
         ap += BK
@@ -224,6 +264,7 @@ def _mm16_gate_add(a, w_nk, res, g, out_y, out_dy, half):
     _mm16_gate_add_kernel[grid](
         a, w_nk, res, g, out_y, out_dy, M, N, K, half,
         EVEN_M=(M % 256 == 0), EVEN_N=(N % 256 == 0),
+        EVEN_K=(K % 128 == 0),
     )
 
 
@@ -240,6 +281,8 @@ def _rmsnorm_jvp_strided_kernel(X, DX, W, Y, DY, D, sx, sy, eps,
     # X, DX: primal/tangent input rows, row stride sx, D valid columns
     # Y, DY: primal/tangent output rows, row stride sy
     # W: (D,) norm gain
+    # CLAMP: clamp outputs to [-CLAMP, CLAMP] (0 disables): dy blows up as
+    # dx/sqrt(eps) on near-zero-norm rows and must not overflow fp16/fp8
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK)                     # (BLOCK,) channel index
     mask = cols < D
@@ -251,8 +294,8 @@ def _rmsnorm_jvp_strided_kernel(X, DX, W, Y, DY, D, sx, sy, eps,
     y = w * x * inv_r                                        # (BLOCK,)
     dy = w * (dx * inv_r - x * (mxdx * inv_r * inv_r * inv_r))
     if CLAMP:
-        y = tl.clamp(y, -448.0, 448.0)
-        dy = tl.clamp(dy, -448.0, 448.0)
+        y = tl.clamp(y, -CLAMP, CLAMP)
+        dy = tl.clamp(dy, -CLAMP, CLAMP)
     tl.store(Y + row * sy + cols, y.to(Y.dtype.element_ty), mask=mask)
     tl.store(DY + row * sy + cols, dy.to(DY.dtype.element_ty), mask=mask)
 
@@ -264,7 +307,7 @@ def _rmsnorm_jvp_strided(x, dx, w, y, dy, d, sx, sy, eps, n_rows):
     num_warps = 4 if BLOCK <= 1024 else 8
     _rmsnorm_jvp_strided_kernel[(n_rows,)](
         x, dx, w, y, dy, d, sx, sy, eps, BLOCK=BLOCK, num_warps=num_warps,
-        CLAMP=(y.dtype == _FP8),
+        CLAMP=_norm_jvp_clamp(y.dtype),
     )
 
 
@@ -287,7 +330,7 @@ def _q_prep_kernel(QB, WQN, COS, SIN, OUT,
                    DR2: tl.constexpr,    # rope angle pairs dr // 2
                    HD: tl.constexpr,     # head dim dn + dr (= 64)
                    BN: tl.constexpr,     # next_power_of_2(DN)
-                   CLAMP: tl.constexpr): # clamp outputs into the fp8 range
+                   CLAMP: tl.constexpr): # clamp outputs to +-CLAMP (0 = off)
     # One program per token row; all NH heads processed as a 2D tile.
     pid = tl.program_id(0)             # token row in [0, B*S)
     b = pid // S                       # batch index
@@ -310,8 +353,8 @@ def _q_prep_kernel(QB, WQN, COS, SIN, OUT,
     yn = w * xn * ir
     dyn = w * (dn_ * ir - xn * (mxdx[:, None] * ir * ir * ir))
     if CLAMP:
-        yn = tl.clamp(yn, -448.0, 448.0)
-        dyn = tl.clamp(dyn, -448.0, 448.0)
+        yn = tl.clamp(yn, -CLAMP, CLAMP)
+        dyn = tl.clamp(dyn, -CLAMP, CLAMP)
     tl.store(OUT + dst_p + off_n, yn.to(OUT.dtype.element_ty), mask=nm)
     tl.store(OUT + dst_t + off_n, dyn.to(OUT.dtype.element_ty), mask=nm)
 
@@ -330,10 +373,10 @@ def _q_prep_kernel(QB, WQN, COS, SIN, OUT,
     dyr = dxr * c - dxi * sn
     dyi = dxr * sn + dxi * c
     if CLAMP:
-        yr = tl.clamp(yr, -448.0, 448.0)
-        yi = tl.clamp(yi, -448.0, 448.0)
-        dyr = tl.clamp(dyr, -448.0, 448.0)
-        dyi = tl.clamp(dyi, -448.0, 448.0)
+        yr = tl.clamp(yr, -CLAMP, CLAMP)
+        yi = tl.clamp(yi, -CLAMP, CLAMP)
+        dyr = tl.clamp(dyr, -CLAMP, CLAMP)
+        dyi = tl.clamp(dyi, -CLAMP, CLAMP)
     tl.store(OUT + dst_p + re, yr.to(OUT.dtype.element_ty))
     tl.store(OUT + dst_p + im, yi.to(OUT.dtype.element_ty))
     tl.store(OUT + dst_t + re, dyr.to(OUT.dtype.element_ty))
@@ -361,7 +404,7 @@ def _kv_prep_kernel(KVB, KR, WKN, COS, SIN, OUTK, OUTV,
                     HD: tl.constexpr,     # qk head dim dn + dr (= 64)
                     BN: tl.constexpr,     # next_power_of_2(DN)
                     KVW: tl.constexpr,    # kv_b per-head width dn + dv
-                    CLAMP: tl.constexpr): # clamp outputs into the fp8 range
+                    CLAMP: tl.constexpr): # clamp outputs to +-CLAMP (0 = off)
     # One program per token row; all NH heads processed as a 2D tile.
     pid = tl.program_id(0)             # token row in [0, B*S)
     b = pid // S
@@ -385,8 +428,8 @@ def _kv_prep_kernel(KVB, KR, WKN, COS, SIN, OUTK, OUTV,
     yn = w * xn * ir
     dyn = w * (dn_ * ir - xn * (mxdx[:, None] * ir * ir * ir))
     if CLAMP:
-        yn = tl.clamp(yn, -448.0, 448.0)
-        dyn = tl.clamp(dyn, -448.0, 448.0)
+        yn = tl.clamp(yn, -CLAMP, CLAMP)
+        dyn = tl.clamp(dyn, -CLAMP, CLAMP)
     tl.store(OUTK + dst_p + off_out, yn.to(OUTK.dtype.element_ty), mask=nm)
     tl.store(OUTK + dst_t + off_out, dyn.to(OUTK.dtype.element_ty), mask=nm)
 
@@ -409,12 +452,12 @@ def _kv_prep_kernel(KVB, KR, WKN, COS, SIN, OUTK, OUTV,
     v = tl.load(KVB + src_p + off_v_in).to(tl.float32)
     dv_ = tl.load(KVB + src_t + off_v_in).to(tl.float32)
     if CLAMP:
-        yr = tl.clamp(yr, -448.0, 448.0)
-        yi = tl.clamp(yi, -448.0, 448.0)
-        dyr = tl.clamp(dyr, -448.0, 448.0)
-        dyi = tl.clamp(dyi, -448.0, 448.0)
-        v = tl.clamp(v, -448.0, 448.0)
-        dv_ = tl.clamp(dv_, -448.0, 448.0)
+        yr = tl.clamp(yr, -CLAMP, CLAMP)
+        yi = tl.clamp(yi, -CLAMP, CLAMP)
+        dyr = tl.clamp(dyr, -CLAMP, CLAMP)
+        dyi = tl.clamp(dyi, -CLAMP, CLAMP)
+        v = tl.clamp(v, -CLAMP, CLAMP)
+        dv_ = tl.clamp(dv_, -CLAMP, CLAMP)
     re = h2 * HD + DN + 2 * i          # (NH, DR2) real-part offsets in OUT
     im = re + 1
     tl.store(OUTK + dst_p + re, yr.to(OUTK.dtype.element_ty))
@@ -551,8 +594,8 @@ def _res_gate_norm_jvp_kernel(P, DP, G, X, DX, W, RES, DRES, Y, DY, D, eps,
     y = w * x * inv_r
     dy = w * (dx * inv_r - x * (mxdx * inv_r * inv_r * inv_r))
     if CLAMP:
-        y = tl.clamp(y, -448.0, 448.0)
-        dy = tl.clamp(dy, -448.0, 448.0)
+        y = tl.clamp(y, -CLAMP, CLAMP)
+        dy = tl.clamp(dy, -CLAMP, CLAMP)
     tl.store(Y + row * D + cols, y.to(Y.dtype.element_ty), mask=mask)
     tl.store(DY + row * D + cols, dy.to(DY.dtype.element_ty), mask=mask)
 
@@ -710,7 +753,10 @@ def _mla_chunk(x, dx, params, rope_cos, rope_sin, eps, variant, out_y, out_dy):
             # Triton fp16-accumulate GEMM (2x the cuBLAS fp32-acc rate)
             return _mm16(a2d, w[key])
 
-    clamp = variant == "fp8"               # fp8 range clamp in prep kernels
+    # norm-JVP clamp limit for the prep / fused-norm kernels: fp8 range for
+    # the fp8 variant, the degenerate-row tangent guard otherwise (the
+    # packed attention buffers are fp16 in both fp16 and bf16 variants)
+    clamp = _CLAMP_FP8 if variant == "fp8" else _CLAMP_FP16
 
     # ---- RMSNorm1 JVP: (b,l,d) fp32 -> stacked (2b,l,d) act_dt ----
     xs = torch.empty(2 * B, S, D, device=dev, dtype=act_dt)

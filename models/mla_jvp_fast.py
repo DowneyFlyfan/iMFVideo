@@ -33,6 +33,7 @@ import triton
 
 from models.triton_block_jvp import _flash_jvp
 from models.triton_mla_block_jvp import (
+    _CLAMP_FP16,
     _mla_fp16_cache,
     _mm16,
     _out_gate_jvp_kernel,
@@ -98,13 +99,14 @@ def _attn_sublayer_jvp(h, dh, p, w16, cos, sin, eps):
     BN = triton.next_power_of_2(dn)
     _q_prep_kernel[(half,)](
         qb, p["w_qnorm"], cos, sin, qv, H * hd, so_b, so_s, B, S, half, eps,
-        NH=H, DN=dn, DR2=dr // 2, HD=hd, BN=BN, CLAMP=False, num_warps=4,
+        NH=H, DN=dn, DR2=dr // 2, HD=hd, BN=BN, CLAMP=_CLAMP_FP16,
+        num_warps=4,
     )
     _kv_prep_kernel[(half,)](
         kvb, a_[:, dq + dc:], p["w_knorm"], cos, sin, kv_, vv,
         H * (dn + dv), wa, so_b, so_s, B, S, half, eps,
         NH=H, DN=dn, DR2=dr // 2, DV=dv, HD=hd, BN=BN, KVW=dn + dv,
-        CLAMP=False, num_warps=4,
+        CLAMP=_CLAMP_FP16, num_warps=4,
     )
 
     attn = torch.empty(2 * B, S, H * dv, device=dev, dtype=_FP16)
