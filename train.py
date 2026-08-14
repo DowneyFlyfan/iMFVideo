@@ -103,7 +103,13 @@ def build_model():
 
     m = config.model
     attn = sdpa_math_attention
-    if m.attn_impl == "sla2_jvp":
+    if m.attn_impl == "sdpa_flash":
+        # Fused sdpa backends: O(S) memory for long sequences on GPUs
+        # without the CuTeDSL kernels. jvp_impl must be "fast".
+        from models.imf_dit_video import sdpa_flash_attention
+
+        attn = sdpa_flash_attention
+    elif m.attn_impl == "sla2_jvp":
         # SLA2 sparse-linear attention: a module factory, one stateful
         # instance (router + alpha params) per transformer block. seq_len
         # and num_heads are bound inside IMFDiTVideo where L is known.

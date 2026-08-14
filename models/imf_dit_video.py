@@ -78,6 +78,29 @@ def sdpa_math_attention(q, k, v):
     return out.transpose(1, 2)
 
 
+def sdpa_flash_attention(q, k, v):
+    """SDPA with fused flash / mem-efficient backends (no math fallback).
+
+    O(S) memory, so it fits long sequences, but it has NO forward-mode AD
+    formula: use only with jvp_impl="fast" (du/dt comes from the hand-rolled
+    Triton pass, never from torch.func.jvp over this function).
+
+    Args:
+        q, k, v: (batch, seq_len, num_heads, head_dim); v may carry a
+            different head dim than q/k (MLA uses v_head_dim != qk_head_dim).
+
+    Returns:
+        (batch, seq_len, num_heads, v_head_dim)
+    """
+    q, k, v = (x.transpose(1, 2) for x in (q, k, v))  # -> (B, H, S, D)
+    with torch.nn.attention.sdpa_kernel([
+        torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+        torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+    ]):
+        out = F.scaled_dot_product_attention(q, k, v)
+    return out.transpose(1, 2)  # (B, S, H, Dv)
+
+
 #################################################################################
 #                              Basic Torch Modules                               #
 #################################################################################
