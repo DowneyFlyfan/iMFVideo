@@ -344,3 +344,19 @@ node. No knob moved the trajectory before the decay tail opened.
   batch size with `decay_fraction` raised to hold decay steps constant.
 
 - Curves for all 15 nodes: `records/tuning_4k_loss_curves.png`.
+
+## Round PT — P_mean / P_std / data_proportion sweep on the tuned schedule (2026-08)
+
+- Settings: bs 1, 1000 steps (compressed WSD: warmup 100, decay_fraction 0.2 -> decay from step 800), lr 2e-3, full uncropped latents, frozen 32-video probe (PROBE_SEED 1234), harness `autotune.py`. Early stop: probe > 0.70 at >= 500 steps (base's pre-decay band; note the first attempt used base's post-decay 0.5554 as the threshold, which would kill every node before its decay phase — two P_mean nodes were re-run after that fix).
+
+| node | override | probe final | at step | train loss_u cv (late half) | early stop |
+|---|---|---|---|---|---|
+| PT_ps08 | P_std 0.8 | **0.5506** | 1000 | 0.39 | |
+| PT_base | none | 0.5554 | 1000 | 0.40 | |
+| PT_dp05 | data_proportion 0.5 | 0.5611 | 1000 | 0.49 | |
+| PT_pm02 | P_mean -0.2 | 0.7009 | 500 | 0.35 | yes (0.7009 > 0.70) |
+| PT_pm06 | P_mean -0.6 | 0.7028 | 600 | 0.32 | yes (0.7028 > 0.70) |
+| PT_ps12 | P_std 1.2 | 0.7381 | 600 | 0.43 | yes |
+| PT_dp01 | data_proportion 0.1 | (killed at ~step 250, sweep stopped on request) | | | |
+
+- PT_ps08 and PT_dp05 both led base during the stable phase (0.6559 / 0.6897 vs 0.6926 at step 600) but only PT_ps08 held the lead through decay. The two P_mean kills were marginal (0.001-0.003 over the threshold); both trailed base at every matched checkpoint before the stop.
