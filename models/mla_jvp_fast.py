@@ -113,25 +113,26 @@ def _attn_sublayer_jvp(h, dh, p, w16, cos, sin, eps):
         # over routed 3D tiles + prefix tail, linear complement, alpha mix.
         cb = p["cube"]
         perm, inv = cb["perm"], cb["inv"]
-        # (B, S, H, hd) fp16 packed views -> (B, H, L, hd) tile-major
-        qb, kb, vb, dqb, dkb, dvb = (
-            t.permute(0, 2, 1, 3)[:, :, perm].contiguous()
-            for t in (qv[:B], kv_[:B], vv[:B], qv[B:], kv_[B:], vv[B:])
-        )
-        # the packed (2B, S, 3, H, hd) buffer is fully copied into the six
-        # tile-major tensors above; drop it before the linear-branch
-        # transients to lower the 16 GB peak.
-        del packed, qv, kv_, vv
         from models.sla2_cube_qat import sla2_cube_qat_jvp
-        o_a, do_a = sla2_cube_qat_jvp(
-            qb, kb, vb, dqb, dkb, dvb, cb["alpha"], cb["topk"],
-            cb["Np"], cb["E"], cb["P"],
-            proj_q=cb["proj_q"], proj_k=cb["proj_k"])
-        # back to model token order, then (B, S, H*dv) fp16 attn buffer
-        attn[:B] = o_a[:, :, inv].permute(0, 2, 1, 3).reshape(
-            B, S, H * dv).to(_FP16)
-        attn[B:] = do_a[:, :, inv].permute(0, 2, 1, 3).reshape(
-            B, S, H * dv).to(_FP16)
+        # one batch row at a time: the six tile-major copies plus the
+        # linear-branch fp32 states scale with B, and the probe runs this
+        # at B=8 -- per-row processing keeps the peak at the B=1 level.
+        for bi in range(B):
+            # (1, S, H, hd) fp16 views -> (1, H, L, hd) tile-major copies
+            qb, kb, vb, dqb, dkb, dvb = (
+                t[bi:bi + 1].permute(0, 2, 1, 3)[:, :, perm].contiguous()
+                for t in (qv[:B], kv_[:B], vv[:B],
+                          qv[B:], kv_[B:], vv[B:])
+            )
+            o_a, do_a = sla2_cube_qat_jvp(
+                qb, kb, vb, dqb, dkb, dvb, cb["alpha"], cb["topk"],
+                cb["Np"], cb["E"], cb["P"],
+                proj_q=cb["proj_q"], proj_k=cb["proj_k"])
+            # back to model token order, into the (B, S, H*dv) fp16 buffer
+            attn[bi] = o_a[0, :, inv].permute(1, 0, 2).reshape(S, H * dv)
+            attn[B + bi] = do_a[0, :, inv].permute(1, 0, 2).reshape(
+                S, H * dv)
+            del qb, kb, vb, dqb, dkb, dvb, o_a, do_a
     elif "sla2" in p:
         # SLA2 sparse-linear attention JVP (models/sla2_mla_jvp.py):
         # sparse branch over routed blocks + complement linear states.
