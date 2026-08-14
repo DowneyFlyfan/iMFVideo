@@ -118,6 +118,10 @@ def _attn_sublayer_jvp(h, dh, p, w16, cos, sin, eps):
             t.permute(0, 2, 1, 3)[:, :, perm].contiguous()
             for t in (qv[:B], kv_[:B], vv[:B], qv[B:], kv_[B:], vv[B:])
         )
+        # the packed (2B, S, 3, H, hd) buffer is fully copied into the six
+        # tile-major tensors above; drop it before the linear-branch
+        # transients to lower the 16 GB peak.
+        del packed, qv, kv_, vv
         from models.sla2_cube_qat import sla2_cube_qat_jvp
         o_a, do_a = sla2_cube_qat_jvp(
             qb, kb, vb, dqb, dkb, dvb, cb["alpha"], cb["topk"],

@@ -181,7 +181,10 @@ def sla2_cube_qat_jvp(q, k, v, dq, dk, dv, alpha, topk_frac, Np, E,
     q8, qs = quantize_qkv(qc[0], E)        # int8 (B,H,L,D) + (B,H,NB) scales
     k8, ks = quantize_qkv(qc[1], E)
     Mb = lut.shape[2]
-    o = torch.empty(B, H, L, D, device=q.device, dtype=torch.float32)
+    # fp16 outputs: halves the resident footprint at 29k tokens; the caller
+    # (mla_jvp_fast) stores into an fp16 buffer anyway, and the flash-JVP
+    # accumulators inside the kernel stay fp32.
+    o = torch.empty(B, H, L, D, device=q.device, dtype=torch.float16)
     do = torch.empty_like(o)
     NPE = Np * E
     grid = (Mb, B * H)
@@ -208,14 +211,16 @@ def sla2_cube_qat_jvp(q, k, v, dq, dk, dv, alpha, topk_frac, Np, E,
         kphi, dkphi = _phi_jvp(k[:, sl], dk[:, sl])
         ol_h, dol_h = _linear_jvp(qphi, dqphi, kphi, dkphi,
                                   v[:, sl], dv[:, sl], lut[:, sl], Np, E)
-        o_l[:, sl] = ol_h
-        do_l[:, sl] = dol_h
+        o_l[:, sl] = ol_h.half()
+        do_l[:, sl] = dol_h.half()
+        del qphi, dqphi, kphi, dkphi, ol_h, dol_h
 
     if torch.is_tensor(alpha) and alpha.dim() == 2:
         reps = torch.tensor([E] * Np + ([P] if P else []), device=q.device)
         a = alpha.float().repeat_interleave(reps, dim=-1).view(1, H, L, 1)
     else:
         a = torch.as_tensor(alpha, device=q.device, dtype=torch.float32)
+    a = a.half()  # keep the mix and outputs fp16 (footprint at 29k tokens)
     return a * o + (1.0 - a) * o_l, a * do + (1.0 - a) * do_l
 
 
