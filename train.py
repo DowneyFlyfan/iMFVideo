@@ -109,6 +109,24 @@ def build_model():
         from models.imf_dit_video import sdpa_flash_attention
 
         attn = sdpa_flash_attention
+    elif m.attn_impl == "sla2_cube_qat":
+        # Cube-block (VSA 3D tiles) sparse-linear attention with INT8 QAT
+        # training forward; one stateful instance per block. seq_len and
+        # num_heads are bound inside IMFDiTVideo; the patch grid is known
+        # here from the data config.
+        from functools import partial
+
+        from models.sla2_cube_qat import SLA2CubeQATAttentionImpl
+
+        pt, ph, pw = m.patch_size
+        lh, lw = config.data.latent_size
+        attn = partial(
+            SLA2CubeQATAttentionImpl,
+            grid=(config.data.latent_frames // pt, lh // ph, lw // pw),
+            tile=(4, 4, 4),
+            topk=m.sla2_topk,
+            alpha_init=m.sla2_alpha_init,
+        )
     elif m.attn_impl == "sla2_jvp":
         # SLA2 sparse-linear attention: a module factory, one stateful
         # instance (router + alpha params) per transformer block. seq_len

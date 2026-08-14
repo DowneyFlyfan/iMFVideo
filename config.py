@@ -28,7 +28,7 @@ class ModelConfig:
     patch_size: tuple = (1, 2, 2)
     in_channels: int = 16  # Wan2.1 VAE latent channels
     num_classes: int = 1000
-    attn_impl: str = "flash_jvp"  # "flash_jvp" (CuTeDSL) | "sla2_jvp" (sparse-linear) | "sdpa"
+    attn_impl: str = "flash_jvp"  # "flash_jvp" | "sla2_jvp" | "sla2_cube_qat" | "sdpa_flash" | "sdpa"
     mla_use_output_gate: bool = True
 
     # --- SLA2 sparse-linear attention (attn_impl="sla2_jvp") ---

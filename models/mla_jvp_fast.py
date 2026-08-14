@@ -108,7 +108,27 @@ def _attn_sublayer_jvp(h, dh, p, w16, cos, sin, eps):
     )
 
     attn = torch.empty(2 * B, S, H * dv, device=dev, dtype=_FP16)
-    if "sla2" in p:
+    if "cube" in p:
+        # SLA2-Cube-QAT JVP (models/sla2_cube_qat.py): int8 primal scores
+        # over routed 3D tiles + prefix tail, linear complement, alpha mix.
+        cb = p["cube"]
+        perm, inv = cb["perm"], cb["inv"]
+        # (B, S, H, hd) fp16 packed views -> (B, H, L, hd) tile-major
+        qb, kb, vb, dqb, dkb, dvb = (
+            t.permute(0, 2, 1, 3)[:, :, perm].contiguous()
+            for t in (qv[:B], kv_[:B], vv[:B], qv[B:], kv_[B:], vv[B:])
+        )
+        from models.sla2_cube_qat import sla2_cube_qat_jvp
+        o_a, do_a = sla2_cube_qat_jvp(
+            qb, kb, vb, dqb, dkb, dvb, cb["alpha"], cb["topk"],
+            cb["Np"], cb["E"], cb["P"],
+            proj_q=cb["proj_q"], proj_k=cb["proj_k"])
+        # back to model token order, then (B, S, H*dv) fp16 attn buffer
+        attn[:B] = o_a[:, :, inv].permute(0, 2, 1, 3).reshape(
+            B, S, H * dv).to(_FP16)
+        attn[B:] = do_a[:, :, inv].permute(0, 2, 1, 3).reshape(
+            B, S, H * dv).to(_FP16)
+    elif "sla2" in p:
         # SLA2 sparse-linear attention JVP (models/sla2_mla_jvp.py):
         # sparse branch over routed blocks + complement linear states.
         sl = p["sla2"]  # dict: alpha (H,Mb) fp32, proj_q/proj_k (hd,hd), knobs
@@ -218,7 +238,19 @@ def build_fast_jvp_state(net):
         p["mlp_res_norm"] = block.mlp_res_norm.weight.detach()     # (d,)
         p["mlp_res_proj"] = block.mlp_res_proj.weight.detach()     # (1, d)
         impl = getattr(block.attn, "attn_impl", None)
-        if isinstance(impl, torch.nn.Module) and hasattr(impl, "sla2"):
+        if isinstance(impl, torch.nn.Module) and hasattr(impl, "perm"):
+            # SLA2-Cube-QAT attention: snapshot routing/mixing/tiling params
+            # so the fast JVP path reproduces the training-forward function.
+            p["cube"] = {
+                "alpha": torch.sigmoid(
+                    impl.alpha_logit.detach()).float(),        # (H, Mb)
+                "proj_q": impl.proj_q.detach(),                # (hd, hd)
+                "proj_k": impl.proj_k.detach(),                # (hd, hd)
+                "topk": impl.topk_frac, "Np": impl.Np, "E": impl.E,
+                "P": impl.prefix_len,
+                "perm": impl.perm, "inv": impl.inv,            # (L,) each
+            }
+        elif isinstance(impl, torch.nn.Module) and hasattr(impl, "sla2"):
             # SLA2 attention: snapshot the routing/mixing params so the fast
             # JVP path reproduces the training-forward attention function.
             p["sla2"] = {
