@@ -385,16 +385,31 @@ class SLA2CubeQATAttentionImpl(nn.Module):
                 return o.permute(0, 2, 1, 3).to(q.dtype)
             return o[:, :, self.inv].permute(0, 2, 1, 3).to(q.dtype)
         else:
-            # guidance path (no_grad): primal-only JVP kernel (int8 primal
-            # scores, no tangent loads/dots) + states-based linear branch;
-            # ~2x leaner than the autograd kernels.
-            o_s = _sparse_primal_only(qh, kh, vh, lut, T, self.Np, self.E,
-                                      self.prefix_len)        # (B,H,L,D)
-            qphi = torch.softmax(qh.float(), -1)              # (B,H,L,D)
-            kphi = torch.softmax(kh.float(), -1)
-            o_l, _ = _linear_jvp(qphi, None, kphi, None, vh, None, lut,
-                                 self.Np, self.E,
-                                 primal_only=True)            # (B,H,L,D)
+            # guidance path (no_grad): same direct kernels as the training
+            # Function (vendored int8 sparse fwd with fused phi + states
+            # linear fwd), no context saving.
+            B_, H_, L_, D_ = qh.shape
+            M_BLOCKS = triton.cdiv(L_, self.E)
+            o_s = torch.empty_like(vh)                        # (B,H,L,D)
+            lse = torch.empty(B_, H_, L_, device=qh.device,
+                              dtype=torch.float32)
+            qphi = torch.empty_like(qh)                       # (B,H,L,D)
+            _attn_fwd_qat[(M_BLOCKS, B_ * H_)](
+                qh, kh, vh, lut_aug, lse, o_s, qphi,
+                D_ ** -0.5, T + 1, L_, M_BLOCKS, D_, self.E, self.E,
+                self.use_int8, True, num_warps=4, num_stages=3,
+            )
+            kphi = torch.softmax(kh.float(), -1).to(qh.dtype).contiguous()
+            htot, ztot = _precompute_global(qphi, kphi, vh)
+            o_l = torch.empty_like(vh)                        # (B,H,L,D)
+            den = torch.empty(B_, H_, L_, device=qh.device,
+                              dtype=torch.float32)
+            _lin_fwd2[(M_BLOCKS, B_ * H_)](
+                qphi, kphi, vh, htot.to(qh.dtype).contiguous(), ztot,
+                lut_aug, o_l, den, o_l, ztot, o_l,
+                T + 1, L_, M_BLOCKS, D_, self.E, self.E, False, False,
+                T + 1 <= 4, num_warps=8, num_stages=3,
+            )
 
         reps = [self.E] * self.Np + [self.prefix_len]
         a = torch.sigmoid(self.alpha_logit).repeat_interleave(
