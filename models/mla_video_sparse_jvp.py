@@ -303,7 +303,8 @@ def _phi_jvp(x, dx):
     return phi, dphi
 
 
-def _linear_jvp(qphi, dqphi, kphi, dkphi, v, dv, lut, Np, E):
+def _linear_jvp(qphi, dqphi, kphi, dkphi, v, dv, lut, Np, E,
+                primal_only=False):
     """Complement linear branch over NON-selected video tiles.
 
     The prefix tail block is excluded entirely (it is always in the sparse
@@ -313,27 +314,28 @@ def _linear_jvp(qphi, dqphi, kphi, dkphi, v, dv, lut, Np, E):
         qphi..dv: (B, H, L, D) fp32/fp16, tile-major order.
         lut: (B, H, Mb, T) int32 selected tile ids in [0, Np).
         Np: number of video tiles;  E: tile length.
+        primal_only: skip the whole tangent chain (guidance no-grad path
+            passes zero tangents; computing them wastes ~half the branch).
 
     Returns:
-        (o_l, do_l): (B, H, L, D) fp32.
+        (o_l, do_l): (B, H, L, D) fp32; do_l is None when primal_only.
     """
     B, H, L, D = qphi.shape
     Dv = v.shape[-1]
     Mb = lut.shape[2]
 
     kb = kphi.float()[:, :, :Np * E].view(B, H, Np, E, D)    # (B,H,Np,E,D)
-    dkb = dkphi.float()[:, :, :Np * E].view(B, H, Np, E, D)
     vb = v.float()[:, :, :Np * E].view(B, H, Np, E, Dv)
-    dvb = dv.float()[:, :, :Np * E].view(B, H, Np, E, Dv)
-
     Hb = torch.einsum("bhntd,bhntv->bhndv", kb, vb)          # (B,H,Np,D,Dv)
-    dHb = (torch.einsum("bhntd,bhntv->bhndv", dkb, vb)
-           + torch.einsum("bhntd,bhntv->bhndv", kb, dvb))
     zb = kb.sum(3)                                           # (B,H,Np,D)
-    dzb = dkb.sum(3)
-
-    H_all, dH_all = Hb.sum(2), dHb.sum(2)                    # (B,H,D,Dv)
-    z_all, dz_all = zb.sum(2), dzb.sum(2)                    # (B,H,D)
+    H_all, z_all = Hb.sum(2), zb.sum(2)         # (B,H,D,Dv), (B,H,D)
+    if not primal_only:
+        dkb = dkphi.float()[:, :, :Np * E].view(B, H, Np, E, D)
+        dvb = dv.float()[:, :, :Np * E].view(B, H, Np, E, Dv)
+        dHb = (torch.einsum("bhntd,bhntv->bhndv", dkb, vb)
+               + torch.einsum("bhntd,bhntv->bhndv", kb, dvb))
+        dzb = dkb.sum(3)                                     # (B,H,Np,D)
+        dH_all, dz_all = dHb.sum(2), dzb.sum(2)
 
     T = lut.shape[-1]
     idx = lut.long()                                         # (B,H,Mb,T)
@@ -344,42 +346,46 @@ def _linear_jvp(qphi, dqphi, kphi, dkphi, v, dv, lut, Np, E):
         ix5 = idx.view(B, H, Mb * T, 1, 1).expand(-1, -1, -1, D, Dv)
         ix4 = idx.view(B, H, Mb * T, 1).expand(-1, -1, -1, D)
         gH = torch.gather(Hb, 2, ix5).view(B, H, Mb, T, D, Dv).sum(3)
-        gdH = torch.gather(dHb, 2, ix5).view(B, H, Mb, T, D, Dv).sum(3)
         gz = torch.gather(zb, 2, ix4).view(B, H, Mb, T, D).sum(3)
-        gdz = torch.gather(dzb, 2, ix4).view(B, H, Mb, T, D).sum(3)
+        if not primal_only:
+            gdH = torch.gather(dHb, 2, ix5).view(B, H, Mb, T, D, Dv).sum(3)
+            gdz = torch.gather(dzb, 2, ix4).view(B, H, Mb, T, D).sum(3)
     else:
         # accumulate one LUT entry at a time: peak (B,H,Mb,D,Dv) per term,
         # identical results -- needed beside training on a 16 GB card.
         gH = torch.zeros(B, H, Mb, D, Dv, device=Hb.device)  # (B,H,Mb,D,Dv)
-        gdH = torch.zeros_like(gH)
         gz = torch.zeros(B, H, Mb, D, device=Hb.device)      # (B,H,Mb,D)
-        gdz = torch.zeros_like(gz)
+        gdH = None if primal_only else torch.zeros_like(gH)
+        gdz = None if primal_only else torch.zeros_like(gz)
         for j in range(T):
             ix5 = idx[..., j].view(B, H, Mb, 1, 1).expand(-1, -1, -1, D, Dv)
             ix4 = idx[..., j].view(B, H, Mb, 1).expand(-1, -1, -1, D)
             gH += torch.gather(Hb, 2, ix5)
-            gdH += torch.gather(dHb, 2, ix5)
             gz += torch.gather(zb, 2, ix4)
-            gdz += torch.gather(dzb, 2, ix4)
+            if not primal_only:
+                gdH += torch.gather(dHb, 2, ix5)
+                gdz += torch.gather(dzb, 2, ix4)
 
     H_c = H_all.unsqueeze(2) - gH                            # (B,H,Mb,D,Dv)
-    dH_c = dH_all.unsqueeze(2) - gdH
     z_c = z_all.unsqueeze(2) - gz                            # (B,H,Mb,D)
-    dz_c = dz_all.unsqueeze(2) - gdz
 
     # query tokens grouped by block: Mb blocks of E rows (tail zero-padded)
     padq = Mb * E - L
     qg = F.pad(qphi.float(), (0, 0, 0, padq)).view(B, H, Mb, E, D)
-    dqg = F.pad(dqphi.float(), (0, 0, 0, padq)).view(B, H, Mb, E, D)
 
     num = torch.einsum("bhmtd,bhmdv->bhmtv", qg, H_c)        # (B,H,Mb,E,Dv)
+    den = torch.einsum("bhmtd,bhmd->bhmt", qg, z_c) + _EPS_L  # (B,H,Mb,E)
+    o_l = num / den.unsqueeze(-1)                            # (B,H,Mb,E,Dv)
+    if primal_only:
+        return o_l.view(B, H, Mb * E, Dv)[:, :, :L], None
+
+    dH_c = dH_all.unsqueeze(2) - gdH                         # (B,H,Mb,D,Dv)
+    dz_c = dz_all.unsqueeze(2) - gdz                         # (B,H,Mb,D)
+    dqg = F.pad(dqphi.float(), (0, 0, 0, padq)).view(B, H, Mb, E, D)
     dnum = (torch.einsum("bhmtd,bhmdv->bhmtv", dqg, H_c)
             + torch.einsum("bhmtd,bhmdv->bhmtv", qg, dH_c))
-    den = torch.einsum("bhmtd,bhmd->bhmt", qg, z_c) + _EPS_L  # (B,H,Mb,E)
     dden = (torch.einsum("bhmtd,bhmd->bhmt", dqg, z_c)
             + torch.einsum("bhmtd,bhmd->bhmt", qg, dz_c))
-
-    o_l = num / den.unsqueeze(-1)                            # (B,H,Mb,E,Dv)
     do_l = (dnum - o_l * dden.unsqueeze(-1)) / den.unsqueeze(-1)
     o_l = o_l.view(B, H, Mb * E, Dv)[:, :, :L]               # (B,H,L,Dv)
     do_l = do_l.view(B, H, Mb * E, Dv)[:, :, :L]

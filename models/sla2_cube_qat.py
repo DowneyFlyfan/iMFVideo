@@ -369,12 +369,11 @@ class SLA2CubeQATAttentionImpl(nn.Module):
             # ~2x leaner than the autograd kernels.
             o_s = _sparse_primal_only(qh, kh, vh, lut, T, self.Np, self.E,
                                       self.prefix_len)        # (B,H,L,D)
-            qphi, _ = _phi_jvp(qh, qh)                        # (B,H,L,D)
-            kphi, _ = _phi_jvp(kh, kh)
-            zeros = torch.zeros_like(qphi)
-            o_l, _ = _linear_jvp(qphi, zeros, kphi, zeros,
-                                 vh, torch.zeros_like(vh), lut,
-                                 self.Np, self.E)             # (B,H,L,D)
+            qphi = torch.softmax(qh.float(), -1)              # (B,H,L,D)
+            kphi = torch.softmax(kh.float(), -1)
+            o_l, _ = _linear_jvp(qphi, None, kphi, None, vh, None, lut,
+                                 self.Np, self.E,
+                                 primal_only=True)            # (B,H,L,D)
 
         reps = [self.E] * self.Np + [self.prefix_len]
         a = torch.sigmoid(self.alpha_logit).repeat_interleave(
