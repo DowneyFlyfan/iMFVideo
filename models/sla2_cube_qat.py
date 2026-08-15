@@ -306,9 +306,15 @@ class SLA2CubeQATAttentionImpl(nn.Module):
         use_int8: run the sparse training forward in INT8 (QAT).
     """
 
+    TILE_MAJOR = True  # supports model-level tile-major residency
+
     def __init__(self, head_dim, seq_len, num_heads, grid, tile=(4, 4, 4),
-                 topk=0.03, alpha_init=0.9, use_int8=True):
+                 topk=0.03, alpha_init=0.9, use_int8=True,
+                 pre_permuted=False):
+        # pre_permuted: the MODEL keeps the whole sequence in tile-major
+        # token order (IMFDiTVideo.tile_major); skip per-call permutes.
         super().__init__()
+        self.pre_permuted = pre_permuted
         self.E = tile[0] * tile[1] * tile[2]
         self.topk_frac = topk
         self.use_int8 = use_int8
@@ -338,9 +344,16 @@ class SLA2CubeQATAttentionImpl(nn.Module):
     def forward(self, q, k, v):
         """q, k, v: (b, l, H, hd) -> (b, l, H, hd) attention output."""
         B, L, H, D = q.shape
-        qh = q.permute(0, 2, 1, 3)[:, :, self.perm].half().contiguous()
-        kh = k.permute(0, 2, 1, 3)[:, :, self.perm].half().contiguous()
-        vh = v.permute(0, 2, 1, 3)[:, :, self.perm].half().contiguous()
+        if self.pre_permuted:
+            # tokens already tile-major: only the (B,L,H,D)->(B,H,L,D)
+            # layout transpose remains
+            qh = q.permute(0, 2, 1, 3).half().contiguous()
+            kh = k.permute(0, 2, 1, 3).half().contiguous()
+            vh = v.permute(0, 2, 1, 3).half().contiguous()
+        else:
+            qh = q.permute(0, 2, 1, 3)[:, :, self.perm].half().contiguous()
+            kh = k.permute(0, 2, 1, 3)[:, :, self.perm].half().contiguous()
+            vh = v.permute(0, 2, 1, 3)[:, :, self.perm].half().contiguous()
         #   (B, H, L, D) fp16, tile-major token order
 
         # router: hard top-k video tiles (detached; trains via proj grads
@@ -368,6 +381,8 @@ class SLA2CubeQATAttentionImpl(nn.Module):
             o = _CubeQATFunction.apply(qh, kh, vh, self.alpha_logit, lut,
                                        lut_aug, mask, T, self.E,
                                        self.use_int8, self.a_index)
+            if self.pre_permuted:
+                return o.permute(0, 2, 1, 3).to(q.dtype)
             return o[:, :, self.inv].permute(0, 2, 1, 3).to(q.dtype)
         else:
             # guidance path (no_grad): primal-only JVP kernel (int8 primal
@@ -386,6 +401,8 @@ class SLA2CubeQATAttentionImpl(nn.Module):
             torch.tensor(reps, device=q.device), dim=-1)       # (H, L)
         a = a.view(1, H, L, 1).to(o_s.dtype)
         o = a * o_s + (1.0 - a) * o_l                          # (B,H,L,D)
+        if self.pre_permuted:
+            return o.permute(0, 2, 1, 3).to(q.dtype)
         return o[:, :, self.inv].permute(0, 2, 1, 3).to(q.dtype)
 
 

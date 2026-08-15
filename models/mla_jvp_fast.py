@@ -121,24 +121,41 @@ def _attn_sublayer_jvp(h, dh, p, w16, cos, sin, eps):
         # launch latency, so batch rows are grouped there.
         from models.mla_video_sparse_jvp import _plenty_of_vram
         row_group = B if _plenty_of_vram(attn.device) else 1
+        pre_perm = cb.get("pre_permuted", False)
         for bi in range(0, B, row_group):
             g = min(row_group, B - bi)  # rows in this group
             # (g, S, H, hd) fp16 views -> (g, H, L, hd) tile-major copies
-            qb, kb, vb, dqb, dkb, dvb = (
-                t[bi:bi + g].permute(0, 2, 1, 3)[:, :, perm].contiguous()
-                for t in (qv[:B], kv_[:B], vv[:B],
-                          qv[B:], kv_[B:], vv[B:])
-            )
+            # (when the model runs tile-major residency the tokens are
+            # already in tile order: layout transpose only)
+            if pre_perm:
+                qb, kb, vb, dqb, dkb, dvb = (
+                    t[bi:bi + g].permute(0, 2, 1, 3).contiguous()
+                    for t in (qv[:B], kv_[:B], vv[:B],
+                              qv[B:], kv_[B:], vv[B:])
+                )
+            else:
+                qb, kb, vb, dqb, dkb, dvb = (
+                    t[bi:bi + g].permute(0, 2, 1, 3)[:, :, perm].contiguous()
+                    for t in (qv[:B], kv_[:B], vv[:B],
+                              qv[B:], kv_[B:], vv[B:])
+                )
             o_a, do_a = sla2_cube_qat_jvp(
                 qb, kb, vb, dqb, dkb, dvb, cb["alpha"], cb["topk"],
                 cb["Np"], cb["E"], cb["P"],
                 proj_q=cb["proj_q"], proj_k=cb["proj_k"])
             #   o_a, do_a: (g, H, L, dv) fp32, tile-major token order
-            # back to model token order, into the (B, S, H*dv) fp16 buffer
-            attn[bi:bi + g] = o_a[:, :, inv].permute(0, 2, 1, 3).reshape(
-                g, S, H * dv)
-            attn[B + bi:B + bi + g] = do_a[:, :, inv].permute(
-                0, 2, 1, 3).reshape(g, S, H * dv)
+            # into the (B, S, H*dv) fp16 buffer (stay tile-major under
+            # residency; otherwise scatter back to model order)
+            if pre_perm:
+                attn[bi:bi + g] = o_a.permute(0, 2, 1, 3).reshape(
+                    g, S, H * dv)
+                attn[B + bi:B + bi + g] = do_a.permute(
+                    0, 2, 1, 3).reshape(g, S, H * dv)
+            else:
+                attn[bi:bi + g] = o_a[:, :, inv].permute(
+                    0, 2, 1, 3).reshape(g, S, H * dv)
+                attn[B + bi:B + bi + g] = do_a[:, :, inv].permute(
+                    0, 2, 1, 3).reshape(g, S, H * dv)
             del qb, kb, vb, dqb, dkb, dvb, o_a, do_a
     elif "sla2" in p:
         # SLA2 sparse-linear attention JVP (models/sla2_mla_jvp.py):
@@ -254,6 +271,7 @@ def build_fast_jvp_state(net):
             # SLA2-Cube-QAT attention: snapshot routing/mixing/tiling params
             # so the fast JVP path reproduces the training-forward function.
             p["cube"] = {
+                "pre_permuted": getattr(net, "tile_major", False),
                 "alpha": torch.sigmoid(
                     impl.alpha_logit.detach()).float(),        # (H, Mb)
                 "proj_q": impl.proj_q.detach(),                # (hd, hd)
@@ -316,6 +334,10 @@ def model_du_dt_fast(net, state, x, t, h, w_cfg, t_min, t_max, y, v_c):
         (x, h), (v_c, torch.ones_like(h)),
     )                                                # (b, l, d) each
 
+    if getattr(net, "tile_major", False):
+        # tile-major residency: one gather here replaces per-block gathers
+        seq = seq[:, net.tm_perm]
+        dseq = dseq[:, net.tm_perm]
     prefix, dprefix = seq, dseq
     snaps, dsnaps = [], []
     idx = 0
@@ -351,6 +373,10 @@ def model_du_dt_fast(net, state, x, t, h, w_cfg, t_min, t_max, y, v_c):
     useq, duseq = _attn_res_pair(prefix, dprefix, snaps, dsnaps,
                                  gain, proj_w, eps)
     pt = state["prefix_tokens"]
+    if getattr(net, "tile_major", False):
+        # back to model order before the position-dependent slice
+        useq = useq[:, net.tm_inv]
+        duseq = duseq[:, net.tm_inv]
     ut, dut = useq[:, pt:], duseq[:, pt:]            # (b, n_patch, d)
     nw, lw, lb = state["u_final"]                    # norm gain, W, bias
     # FinalLayer jvp: y = W @ rmsnorm(u) + b -> dy = W @ d(rmsnorm)(du)

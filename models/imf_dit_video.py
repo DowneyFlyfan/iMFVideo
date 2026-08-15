@@ -769,12 +769,35 @@ class IMFDiTVideo(nn.Module):
         # per-(head, query-block) alpha eagerly; bind them here where L is
         # first known, before the blocks instantiate the factory per block.
         from functools import partial as _partial
+        self.tile_major = False
         if isinstance(attn_impl, _partial) and isinstance(attn_impl.func, type):
             attn_impl = _partial(
                 attn_impl,
                 seq_len=self.prefix_tokens + num_patches,
                 num_heads=num_heads,
             )
+            # Tile-major residency for cube attention: keep the WHOLE
+            # sequence in 3D-tile token order for the entire forward, so
+            # the per-block permute gathers (6 per block per pass) become
+            # ONE permute after the sequence embed and ONE inverse before
+            # the output heads. Every block op except attention and RoPE
+            # is per-token and therefore order-agnostic; RoPE tables are
+            # permuted once below.
+            if getattr(attn_impl.func, "TILE_MAJOR", False):
+                from models.mla_video_sparse_jvp import tile_permutation
+                tile = attn_impl.keywords.get("tile", (4, 4, 4))
+                tm_perm, tm_inv, _ = tile_permutation(
+                    self.grid_size, tile, self.prefix_tokens,
+                    torch.device("cpu"))
+                # tm_perm/tm_inv: (L,) int64 model-order <-> tile-order
+                self.register_buffer("tm_perm", tm_perm, persistent=False)
+                self.register_buffer("tm_inv", tm_inv, persistent=False)
+                self.tile_major = True
+                attn_impl = _partial(attn_impl, pre_permuted=True)
+                # rope_cos/rope_sin: (L, dr//2) angle tables aligned with
+                # token positions -> permute rows into tile order once
+                self.rope_cos = self.rope_cos[tm_perm]
+                self.rope_sin = self.rope_sin[tm_perm]
 
         block_kwargs = dict(
             hidden_size=hidden_size,
@@ -988,6 +1011,11 @@ class IMFDiTVideo(nn.Module):
         # We don't explicitly condition on time t, only on h = t - r
         # following https://arxiv.org/abs/2502.13129
         seq = self._build_sequence(x, h, w, t_min, t_max, y)
+        if self.tile_major:
+            # one permute for the whole forward: (B, L, d) model order ->
+            # 3D-tile order; every per-token op is order-agnostic and the
+            # RoPE tables were permuted at build time.
+            seq = seq[:, self.tm_perm]
 
         if self.attn_res_block_size > 0:
             shared_depth = len(self.shared_blocks)
@@ -1028,6 +1056,11 @@ class IMFDiTVideo(nn.Module):
             for block in self.v_heads:
                 v_seq = run_block(block, v_seq)
 
+        if self.tile_major:
+            # back to model token order before the position-dependent
+            # prefix slice + unpatchify
+            u_seq = u_seq[:, self.tm_inv]
+            v_seq = v_seq[:, self.tm_inv]
         u_tokens = u_seq[:, self.prefix_tokens :]
         v_tokens = v_seq[:, self.prefix_tokens :]
 
