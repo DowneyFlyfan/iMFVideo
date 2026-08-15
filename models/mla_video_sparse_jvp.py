@@ -491,3 +491,69 @@ def mvs_dense_ref(q, k, v, alpha, lut, Np, E, prefix_len):
 
     a = alpha.repeat_interleave(reps, dim=-1).view(1, H, L, 1)
     return a * o_s + (1.0 - a) * o_l
+
+
+# ---------------------------------------------------------------------------
+# Fused router kernel: per-tile mean pooling + smooth-k + projected scores
+# in one program per (b, h). Replaces 5 ms of torch glue (pad/view/mean,
+# mean-subtract, two GEMMs, scores) with ~1 ms; top-k stays in torch.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _route_pool_kernel(
+    X,                          # (B, H, L, D) fp16 tokens (q or k)
+    OUT,                        # (B, H, NBLK, D) fp32 pooled tiles
+    s_xb, s_xh, s_xs,           # strides of X
+    s_ob, s_oh, s_on,           # strides of OUT
+    H, L, NPE,                  # NPE = Np * E (video tokens)
+    E: tl.constexpr,            # tile length
+    D: tl.constexpr,            # head dim
+):
+    pid_n = tl.program_id(0)                    # tile id (incl prefix tail)
+    pid_bh = tl.program_id(1)
+    b = pid_bh // H
+    h = pid_bh % H
+    offs_e = tl.arange(0, E)
+    offs_d = tl.arange(0, D)
+    rows = pid_n * E + offs_e                   # token rows of this tile
+    mask = rows < L
+    xp = (b * s_xb + h * s_xh + rows[:, None] * s_xs + offs_d[None, :])
+    x = tl.load(X + xp, mask=mask[:, None], other=0.0).to(tl.float32)
+    cnt = tl.sum(mask.to(tl.float32), 0)        # real tokens in tile
+    mean = tl.sum(x, 0) / cnt                   # (D,)
+    op = b * s_ob + h * s_oh + pid_n * s_on + offs_d
+    tl.store(OUT + op, mean)
+
+
+def route_tiles_fast(q, k, topk_frac, Np, E, prefix_len,
+                     proj_q=None, proj_k=None):
+    """Kernel-pooled variant of route_tiles (identical selection law).
+
+    Args:
+        q, k: (B, H, L, D) fp16 tile-major tokens.
+        topk_frac, Np, E, prefix_len, proj_q, proj_k: as route_tiles.
+
+    Returns:
+        (lut, T): (B, H, Mb, T) int32 video-tile ids and the topk count.
+    """
+    B, H, L, D = q.shape
+    Mb = Np + (1 if prefix_len else 0)
+    qb = torch.empty(B, H, Mb, D, device=q.device, dtype=torch.float32)
+    kb = torch.empty(B, H, Np, D, device=q.device, dtype=torch.float32)
+    grid = lambda nb: (nb, B * H)
+    _route_pool_kernel[grid(Mb)](
+        q, qb, q.stride(0), q.stride(1), q.stride(2),
+        qb.stride(0), qb.stride(1), qb.stride(2),
+        H, L, Np * E, E=E, D=D, num_warps=4)
+    _route_pool_kernel[grid(Np)](
+        k, kb, k.stride(0), k.stride(1), k.stride(2),
+        kb.stride(0), kb.stride(1), kb.stride(2),
+        H, Np * E, Np * E, E=E, D=D, num_warps=4)
+    kb = kb - kb.mean(2, keepdim=True)          # smooth-k
+    if proj_q is not None:
+        qb = qb @ proj_q.t().to(qb.dtype)
+    if proj_k is not None:
+        kb = kb @ proj_k.t().to(kb.dtype)
+    pc = (qb @ kb.transpose(-1, -2)) * (D ** -0.5)   # (B,H,Mb,Np)
+    T = max(1, min(Np, int(topk_frac * Np)))
+    lut = torch.topk(pc, T, dim=-1, sorted=False).indices.to(torch.int32)
+    return lut.contiguous(), T

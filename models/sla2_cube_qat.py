@@ -38,6 +38,7 @@ from models.mla_video_sparse_jvp import (
     _phi_jvp,
     _plenty_of_vram,
     route_tiles,
+    route_tiles_fast,
     tile_permutation,
 )
 from models.sla2_vendor.kernel_linear import _complement_linear_attention
@@ -348,9 +349,10 @@ class SLA2CubeQATAttentionImpl(nn.Module):
         # selection changing is non-differentiable, matching vendored SLA2
         # stage-2 behaviour where the router is frozen-hard per step)
         with torch.no_grad():
-            lut, T = route_tiles(qh, kh, self.topk_frac, self.Np, self.E,
-                                 self.prefix_len,
-                                 proj_q=self.proj_q, proj_k=self.proj_k)
+            lut, T = route_tiles_fast(qh, kh, self.topk_frac, self.Np,
+                                      self.E, self.prefix_len,
+                                      proj_q=self.proj_q,
+                                      proj_k=self.proj_k)
         # append the ragged prefix tail block as an always-selected entry
         tail = torch.full_like(lut[..., :1], self.Nb - 1)      # (B,H,Mb,1)
         lut_aug = torch.cat([lut, tail], dim=-1).contiguous()  # (B,H,Mb,T+1)
@@ -559,8 +561,8 @@ def sla2_cube_qat_jvp_fused(q, k, v, dq, dk, dv, alpha, topk_frac, Np, E,
     scale = D ** -0.5
     P = prefix_len
     if lut is None:
-        lut, T = route_tiles(q, k, topk_frac, Np, E, P,
-                             proj_q=proj_q, proj_k=proj_k)
+        lut, T = route_tiles_fast(q, k, topk_frac, Np, E, P,
+                                  proj_q=proj_q, proj_k=proj_k)
     qc = [t.contiguous().half() for t in (q, k, v, dq, dk, dv)]
     q8, qs = quantize_qkv(qc[0], E)     # int8 (B,H,L,D) + (B,H,NB) scales
     k8, ks = quantize_qkv(qc[1], E)
@@ -686,19 +688,17 @@ class _CubeQATFunction(torch.autograd.Function):
         N_BLOCKS = triton.cdiv(L, E)
         do = do.contiguous()
 
-        a_row = torch.sigmoid(alpha_logit.float())          # (H, Mb)
-        a = a_row[:, a_index].view(1, H, L, 1)              # (1,H,L,1) fp32
-        dof = do.float()
-        # d/d alpha_logit: sum over rows of block mb of do.(o_s - o_l),
-        # times sigmoid'(logit) = a(1-a)
-        diff = (dof * (o_s.float() - o_l.float())).sum((0, 3))  # (H, L)
+        a_row = torch.sigmoid(alpha_logit.float()).contiguous()  # (H, Mb)
         Mb = a_row.shape[1]
-        seg = torch.zeros(H, Mb, device=do.device)
-        seg.index_add_(1, a_index, diff)                    # (H, Mb)
+        do_s = torch.empty_like(do)                         # (B,H,L,D)
+        do_l = torch.empty_like(do)
+        seg = torch.zeros(H, Mb, device=do.device)          # (H, Mb)
+        _bwd_split_kernel[(Mb, B * H)](
+            do, o_s, o_l, a_row, do_s, do_l, seg,
+            do.stride(0), do.stride(1), do.stride(2),
+            a_row.stride(0), seg.stride(0),
+            H, L, E=E, D=D, num_warps=4)
         d_alpha = seg * a_row * (1.0 - a_row)               # (H, Mb)
-
-        do_s = (dof * a).to(do.dtype).contiguous()          # (B,H,L,D)
-        do_l = (dof * (1.0 - a)).to(do.dtype).contiguous()
 
         # ---- sparse branch backward (vendored SLA kernels) ----
         dq_s = torch.empty_like(qh)
@@ -734,14 +734,86 @@ class _CubeQATFunction(torch.autograd.Function):
             num_warps=8, num_stages=2,
         )
 
-        # ---- phi (channel softmax) jacobian chains ----
-        qpf, dqpf = qphi.float(), dqphi.float()
-        dq_phi = qpf * (dqpf - (qpf * dqpf).sum(-1, keepdim=True))
-        kpf, dkpf = kphi.float(), dkphi.float()
-        dk_phi = kpf * (dkpf - (kpf * dkpf).sum(-1, keepdim=True))
-
-        dq = dq_s + dq_phi.to(do.dtype)
-        dk = dk_s + dk_phi.to(do.dtype)
+        # ---- phi (channel softmax) jacobian chains, fused with the add ----
+        Mrows = triton.cdiv(L, E)
+        dq = torch.empty_like(dq_s)
+        dk = torch.empty_like(dk_s)
+        _phi_chain_add_kernel[(Mrows, B * H)](
+            qphi, dqphi, dq_s, dq,
+            qphi.stride(0), qphi.stride(1), qphi.stride(2),
+            H, L, E=E, D=D, num_warps=4)
+        _phi_chain_add_kernel[(Mrows, B * H)](
+            kphi, dkphi, dk_s, dk,
+            kphi.stride(0), kphi.stride(1), kphi.stride(2),
+            H, L, E=E, D=D, num_warps=4)
         dv = dv_s + dv_l
         return (dq, dk, dv, d_alpha, None, None, None, None, None, None,
                 None)
+
+
+# ---------------------------------------------------------------------------
+# Backward micro-fusion kernels.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _bwd_split_kernel(
+    DO, OS, OL, AROW, DOS, DOL, DSEG,
+    s_b, s_h, s_s,             # strides of the (B, H, L, D) tensors
+    s_ab,                      # stride of the (H, Mb) alpha rows
+    s_gb,                      # stride of the (H, Mb) d_alpha seg rows
+    H, L,
+    E: tl.constexpr,           # tile length (query block size)
+    D: tl.constexpr,
+):
+    """Per query tile: do_s = do*a, do_l = do*(1-a), and the alpha-grad
+    segment sum dseg[h, mb] += sum(do * (o_s - o_l)) in one pass.
+
+    DO/OS/OL: (B, H, L, D); AROW: (H, Mb) sigmoid(alpha); DSEG: (H, Mb)
+    fp32 accumulated via atomics (grid covers (Mb, B*H))."""
+    pid_m = tl.program_id(0)               # query tile id (= alpha col mb)
+    pid_bh = tl.program_id(1)
+    b = pid_bh // H
+    h = pid_bh % H
+    offs_e = tl.arange(0, E)
+    offs_d = tl.arange(0, D)
+    rows = pid_m * E + offs_e
+    mask = rows < L
+    base = b * s_b + h * s_h
+    ptr = base + rows[:, None] * s_s + offs_d[None, :]
+    do = tl.load(DO + ptr, mask=mask[:, None], other=0.0).to(tl.float32)
+    os_ = tl.load(OS + ptr, mask=mask[:, None], other=0.0).to(tl.float32)
+    ol_ = tl.load(OL + ptr, mask=mask[:, None], other=0.0).to(tl.float32)
+    a = tl.load(AROW + h * s_ab + pid_m).to(tl.float32)
+    tl.store(DOS + ptr, (do * a).to(DOS.dtype.element_ty),
+             mask=mask[:, None])
+    tl.store(DOL + ptr, (do * (1.0 - a)).to(DOL.dtype.element_ty),
+             mask=mask[:, None])
+    seg = tl.sum(do * (os_ - ol_))
+    tl.atomic_add(DSEG + h * s_gb + pid_m, seg)
+
+
+@triton.jit
+def _phi_chain_add_kernel(
+    PHI, DPHI, DXS, DX,
+    s_b, s_h, s_s,             # strides of the (B, H, L, D) tensors
+    H, L,
+    E: tl.constexpr,
+    D: tl.constexpr,
+):
+    """dx = dx_sparse + phi * (dphi - <phi, dphi>): softmax-jacobian chain
+    fused with the sparse-branch gradient add. All (B, H, L, D)."""
+    pid_m = tl.program_id(0)
+    pid_bh = tl.program_id(1)
+    b = pid_bh // H
+    h = pid_bh % H
+    offs_e = tl.arange(0, E)
+    offs_d = tl.arange(0, D)
+    rows = pid_m * E + offs_e
+    mask = rows < L
+    base = b * s_b + h * s_h
+    ptr = base + rows[:, None] * s_s + offs_d[None, :]
+    phi = tl.load(PHI + ptr, mask=mask[:, None], other=0.0).to(tl.float32)
+    dphi = tl.load(DPHI + ptr, mask=mask[:, None], other=0.0).to(tl.float32)
+    dxs = tl.load(DXS + ptr, mask=mask[:, None], other=0.0).to(tl.float32)
+    dot = tl.sum(phi * dphi, 1)                              # (E,)
+    dx = dxs + phi * (dphi - dot[:, None])
+    tl.store(DX + ptr, dx.to(DX.dtype.element_ty), mask=mask[:, None])
