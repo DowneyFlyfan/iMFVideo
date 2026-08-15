@@ -113,7 +113,7 @@ def _attn_sublayer_jvp(h, dh, p, w16, cos, sin, eps):
         # over routed 3D tiles + prefix tail, linear complement, alpha mix.
         cb = p["cube"]
         perm, inv = cb["perm"], cb["inv"]
-        from models.sla2_cube_qat import sla2_cube_qat_jvp
+        from models.sla2_cube_qat import sla2_cube_qat_jvp_fused as sla2_cube_qat_jvp
         # one batch row at a time: the six tile-major copies plus the
         # linear-branch fp32 states scale with B, and the probe runs this
         # at B=8 -- per-row processing keeps the peak at the B=1 level on

@@ -381,3 +381,222 @@ class SLA2CubeQATAttentionImpl(nn.Module):
         a = a.view(1, H, L, 1).to(o_s.dtype)
         o = a * o_s + (1.0 - a) * o_l                          # (B,H,L,D)
         return o[:, :, self.inv].permute(0, 2, 1, 3).to(q.dtype)
+
+
+# ---------------------------------------------------------------------------
+# FUSED JVP kernel: sparse recurrence + in-kernel phi + complement linear
+# branch + alpha mix, one program per query tile. Replaces the separate
+# phi softmax, states gathers, quotient einsums and mix kernels of the
+# unfused path (~70% of the jvp op time at d=1024 on A100).
+# ---------------------------------------------------------------------------
+@triton.jit
+def _cube_fused_jvp_kernel(
+    Q, K, V, DQ, DK, DV,       # (B, H, L, D) fp16 primal/tangent
+    Q8, K8,                    # (B, H, L, D) int8 per-tile amax quant
+    QS, KS,                    # (B, H, NB) fp32 per-tile quant scales
+    HB, DHB,                   # (B, H, Np, D, Dv) fp32 phi-key/value states
+    ZB, DZB,                   # (B, H, Np, D) fp32 phi-key sums
+    HALL, DHALL,               # (B, H, D, Dv) fp32 global states
+    ZALL, DZALL,               # (B, H, D) fp32 global sums
+    ALPHA,                     # (H, Mb) fp32 sparse/linear mix in (0,1)
+    O, DO, LUT,
+    s_qb, s_qh, s_qs,          # strides of the (B, H, L, D) fp16 tensors
+    s_ob, s_oh, s_os,          # strides of the (B, H, L, D) outputs
+    s_lb, s_lh, s_lm,          # strides of the (B, H, Mb, T) LUT
+    s_sb, s_sh,                # strides of the (B, H, NB) scale tensors
+    s_hb, s_hh, s_hn,          # strides of the (B, H, Np, D, Dv) states
+    s_zbb, s_zbh, s_zbn,       # strides of the (B, H, Np, D) sums
+    s_gb, s_gh,                # strides of the (B, H, D, Dv) globals
+    s_ab,                      # stride of the (H, Mb) alpha rows
+    H, L, T, NPE, scale, eps_l,
+    HEAD_DIM: tl.constexpr,    # D = Dv = 64
+    BLOCK: tl.constexpr,       # E = 64: query tile = key tile = quant block
+):
+    pid_m = tl.program_id(0)               # query block id (= LUT row mb)
+    pid_bh = tl.program_id(1)
+    b = pid_bh // H
+    h = pid_bh % H
+
+    base = b * s_qb + h * s_qh
+    sbase = b * s_sb + h * s_sh
+    offs_m = pid_m * BLOCK + tl.arange(0, BLOCK)   # query token rows
+    offs_n = tl.arange(0, BLOCK)
+    offs_d = tl.arange(0, HEAD_DIM)
+    offs_e = tl.arange(0, HEAD_DIM)
+    mask_m = offs_m < L
+
+    qp = base + offs_m[:, None] * s_qs + offs_d[None, :]
+    q8 = tl.load(Q8 + qp, mask=mask_m[:, None], other=0)     # int8
+    sq = tl.load(QS + sbase + pid_m)                          # fp32 scalar
+    qf = tl.load(Q + qp, mask=mask_m[:, None], other=0.0)    # fp16
+    dq = tl.load(DQ + qp, mask=mask_m[:, None], other=0.0)   # fp16
+
+    # ---- in-kernel phi = softmax over the D channel, with tangent ----
+    qf32 = qf.to(tl.float32)
+    dq32 = dq.to(tl.float32)
+    qmx = tl.max(qf32, 1)                                    # (BLOCK,)
+    qex = tl.exp(qf32 - qmx[:, None])                        # (BLOCK, D)
+    qden = tl.sum(qex, 1)                                    # (BLOCK,)
+    qphi = qex / qden[:, None]                               # (BLOCK, D)
+    qdot = tl.sum(qphi * dq32, 1)                            # (BLOCK,)
+    dqphi = qphi * (dq32 - qdot[:, None])                    # (BLOCK, D)
+
+    # ---- sparse-branch flash-JVP recurrence over T routed + prefix ----
+    m_i = tl.full([BLOCK], float("-inf"), tl.float32)
+    l_i = tl.zeros([BLOCK], tl.float32)
+    mu_i = tl.zeros([BLOCK], tl.float32)
+    acc_o = tl.zeros([BLOCK, HEAD_DIM], tl.float32)
+    acc_do = tl.zeros([BLOCK, HEAD_DIM], tl.float32)
+    LOG2E: tl.constexpr = 1.4426950408889634
+    lut_base = LUT + b * s_lb + h * s_lh + pid_m * s_lm
+
+    # ---- linear-branch complement states, subtracted while looping ----
+    gb = b * s_gb + h * s_gh
+    hc = tl.load(HALL + gb + offs_d[:, None] * HEAD_DIM + offs_e[None, :]
+                 ).to(tl.float32)                            # (D, Dv)
+    dhc = tl.load(DHALL + gb + offs_d[:, None] * HEAD_DIM + offs_e[None, :]
+                  ).to(tl.float32)                           # (D, Dv)
+    # z_all / dz_all are contiguous (B, H, D): row offset = (b*H + h) * D
+    zc = tl.load(ZALL + (b * H + h) * HEAD_DIM + offs_d).to(tl.float32)
+    dzc = tl.load(DZALL + (b * H + h) * HEAD_DIM + offs_d).to(tl.float32)
+
+    hb_base = HB + b * s_hb + h * s_hh
+    dhb_base = DHB + b * s_hb + h * s_hh
+    zb_base = ZB + b * s_zbb + h * s_zbh
+    dzb_base = DZB + b * s_zbb + h * s_zbh
+
+    for j in range(0, T + 1):
+        if j == T:
+            nb_id = NPE // BLOCK           # ragged prefix tail block id
+        else:
+            nb_id = tl.load(lut_base + j)
+        offs = nb_id * BLOCK + offs_n      # key token rows
+        mask_n = offs < L
+        kp = base + offs[:, None] * s_qs + offs_d[None, :]
+        k8 = tl.load(K8 + kp, mask=mask_n[:, None], other=0)  # int8
+        sk = tl.load(KS + sbase + nb_id)                      # fp32 scalar
+        kf = tl.load(K + kp, mask=mask_n[:, None], other=0.0)
+        dk = tl.load(DK + kp, mask=mask_n[:, None], other=0.0)
+
+        s_f = tl.dot(q8, tl.trans(k8), out_dtype=tl.int32).to(tl.float32)
+        s_f = s_f * (sq * sk)
+        ds = (tl.dot(dq, tl.trans(kf), out_dtype=tl.float16).to(tl.float32)
+              + tl.dot(qf, tl.trans(dk),
+                       out_dtype=tl.float16).to(tl.float32)) * scale
+        s2 = tl.where(mask_n[None, :], s_f * (scale * LOG2E), float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(s2, 1))
+        alpha_c = tl.math.exp2(m_i - m_new)
+        p = tl.math.exp2(s2 - m_new[:, None])
+        t = p * ds
+        l_i = l_i * alpha_c + tl.sum(p, 1)
+        mu_i = mu_i * alpha_c + tl.sum(t, 1)
+
+        v = tl.load(V + kp, mask=mask_n[:, None], other=0.0)
+        dv = tl.load(DV + kp, mask=mask_n[:, None], other=0.0)
+        pc = p.to(tl.float16)
+        tc = t.to(tl.float16)
+        o_t = tl.dot(pc, v, out_dtype=tl.float16).to(tl.float32)
+        do_t = (tl.dot(tc, v, out_dtype=tl.float16)
+                + tl.dot(pc, dv, out_dtype=tl.float16)).to(tl.float32)
+        acc_o = acc_o * alpha_c[:, None] + o_t
+        acc_do = acc_do * alpha_c[:, None] + do_t
+        m_i = m_new
+
+        # subtract this routed VIDEO tile's states from the complement
+        # (the prefix tail j == T is never part of the linear branch)
+        if j < T:
+            hp = nb_id * s_hn + offs_d[:, None] * HEAD_DIM + offs_e[None, :]
+            hc -= tl.load(hb_base + hp).to(tl.float32)
+            dhc -= tl.load(dhb_base + hp).to(tl.float32)
+            zp = nb_id * s_zbn + offs_d
+            zc -= tl.load(zb_base + zp).to(tl.float32)
+            dzc -= tl.load(dzb_base + zp).to(tl.float32)
+
+    o_s = acc_o / l_i[:, None]
+    do_s = acc_do / l_i[:, None] - (mu_i / l_i)[:, None] * o_s
+
+    # ---- linear branch quotient (per query row) ----
+    num = tl.dot(qphi, hc)                                   # (BLOCK, Dv)
+    dnum = tl.dot(dqphi, hc) + tl.dot(qphi, dhc)             # (BLOCK, Dv)
+    den = tl.sum(qphi * zc[None, :], 1) + eps_l              # (BLOCK,)
+    dden = tl.sum(dqphi * zc[None, :], 1) + tl.sum(qphi * dzc[None, :], 1)
+    o_l = num / den[:, None]                                 # (BLOCK, Dv)
+    do_l = (dnum - o_l * dden[:, None]) / den[:, None]
+
+    # ---- alpha mix (scalar per (h, mb)) and store ----
+    a = tl.load(ALPHA + h * s_ab + pid_m).to(tl.float32)
+    o = a * o_s + (1.0 - a) * o_l
+    do = a * do_s + (1.0 - a) * do_l
+    op = b * s_ob + h * s_oh + offs_m[:, None] * s_os + offs_d[None, :]
+    tl.store(O + op, o.to(O.dtype.element_ty), mask=mask_m[:, None])
+    tl.store(DO + op, do.to(DO.dtype.element_ty), mask=mask_m[:, None])
+
+
+def sla2_cube_qat_jvp_fused(q, k, v, dq, dk, dv, alpha, topk_frac, Np, E,
+                            prefix_len, proj_q=None, proj_k=None,
+                            lut=None, T=None):
+    """Fused cube-QAT JVP: one kernel for both branches + mix.
+
+    Same math as sla2_cube_qat_jvp (int8 primal scores, fp16 tangent dots,
+    fp32 linear branch), with phi / complement states / quotient / alpha
+    folded into the Triton program. Host precomputes only the quantization
+    and the per-tile phi-states.
+
+    Args:
+        q..dv: (B, H, L, D) fp16 primal / tangent, tile-major order.
+        alpha: (H, Mb) mixing ratio in (0,1) (tensor required here).
+        topk_frac, Np, E, prefix_len, proj_q, proj_k, lut, T: as unfused.
+
+    Returns:
+        (o, do): (B, H, L, D) fp32.
+    """
+    B, H, L, D = q.shape
+    scale = D ** -0.5
+    P = prefix_len
+    if lut is None:
+        lut, T = route_tiles(q, k, topk_frac, Np, E, P,
+                             proj_q=proj_q, proj_k=proj_k)
+    qc = [t.contiguous().half() for t in (q, k, v, dq, dk, dv)]
+    q8, qs = quantize_qkv(qc[0], E)     # int8 (B,H,L,D) + (B,H,NB) scales
+    k8, ks = quantize_qkv(qc[1], E)
+    Mb = lut.shape[2]
+
+    # host-side per-tile phi-states (the only remaining torch math):
+    kphi, dkphi = _phi_jvp(k, dk)                            # (B,H,L,D) fp32
+    kb = kphi[:, :, :Np * E].view(B, H, Np, E, D)            # (B,H,Np,E,D)
+    dkb = dkphi[:, :, :Np * E].view(B, H, Np, E, D)
+    vb = v.float()[:, :, :Np * E].view(B, H, Np, E, D)
+    dvb = dv.float()[:, :, :Np * E].view(B, H, Np, E, D)
+    Hb = torch.einsum("bhntd,bhntv->bhndv", kb, vb).contiguous()
+    dHb = (torch.einsum("bhntd,bhntv->bhndv", dkb, vb)
+           + torch.einsum("bhntd,bhntv->bhndv", kb, dvb)).contiguous()
+    zb = kb.sum(3).contiguous()                              # (B,H,Np,D)
+    dzb = dkb.sum(3).contiguous()
+    H_all = Hb.sum(2).contiguous()                           # (B,H,D,D)
+    dH_all = dHb.sum(2).contiguous()
+    z_all = zb.sum(2).contiguous()                           # (B,H,D)
+    dz_all = dzb.sum(2).contiguous()
+
+    o = torch.empty(B, H, L, D, device=q.device, dtype=torch.float32)
+    do = torch.empty_like(o)
+    af = alpha.float().contiguous()                          # (H, Mb)
+    grid = (Mb, B * H)
+    _cube_fused_jvp_kernel[grid](
+        qc[0], qc[1], qc[2], qc[3], qc[4], qc[5],
+        q8, k8, qs, ks,
+        Hb, dHb, zb, dzb, H_all, dH_all, z_all, dz_all, af,
+        o, do, lut,
+        qc[0].stride(0), qc[0].stride(1), qc[0].stride(2),
+        o.stride(0), o.stride(1), o.stride(2),
+        lut.stride(0), lut.stride(1), lut.stride(2),
+        qs.stride(0), qs.stride(1),
+        Hb.stride(0), Hb.stride(1), Hb.stride(2),
+        zb.stride(0), zb.stride(1), zb.stride(2),
+        H_all.stride(0), H_all.stride(1),
+        af.stride(0),
+        H, L, T, Np * E, scale, _EPS_L,
+        HEAD_DIM=D, BLOCK=E,
+        num_warps=8, num_stages=1,
+    )
+    return o, do
