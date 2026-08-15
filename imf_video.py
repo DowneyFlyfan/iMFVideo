@@ -52,6 +52,12 @@ class IMFVideoLoss(nn.Module):
         # accumulation group instead, which is the quantity the optimizer step
         # actually averages over.
         strat_group=0,
+        # Run every network forward (guidance no-grad pair, primal, sampler)
+        # under bf16 autocast: Linear GEMMs hit tensor cores, master weights
+        # and loss arithmetic stay fp32. Incompatible with jvp_impl
+        # "functorch" (forward-mode AD through autocast casts); the "fast"
+        # path computes du/dt in its own fp16 pipeline and is unaffected.
+        autocast_bf16=False,
     ):
         super().__init__()
         self.stratified_time = stratified_time
@@ -62,6 +68,10 @@ class IMFVideoLoss(nn.Module):
         # joint strata, changing the joint law rather than just its variance.
         self._strat_queues = {}
         self.jvp_impl = jvp_impl
+        self.autocast_bf16 = autocast_bf16
+        assert not (autocast_bf16 and jvp_impl == "functorch"), (
+            "autocast_bf16 requires jvp_impl='fast'"
+        )
         self.net = net
         self.num_classes = num_classes
         self.P_mean = P_mean
@@ -93,7 +103,7 @@ class IMFVideoLoss(nn.Module):
         Returns:
             (B,) float32 stratum indices in [0, G).
         """
-        g = self.strat_group                    # G: strata per group, from config
+        g = self.strat_group  # G: strata per group, from config
         # q: (n,) int64 unconsumed stratum indices for this site, n <= G. Source:
         # self._strat_queues, initialized empty in __init__ and refilled below.
         q = self._strat_queues.get(site)
@@ -122,14 +132,14 @@ class IMFVideoLoss(nn.Module):
         if not self.stratified_time:
             return torch.rand(bz, device=device, dtype=torch.float32)
         if self.strat_group and self.strat_group > bz:
-            g = self.strat_group          # G: group size, batch * grad_accum
+            g = self.strat_group  # G: group size, batch * grad_accum
             # i: (B,) float32 stratum indices in [0, G), popped without
             # replacement from this site's shuffled queue.
             i = self._take_strata(bz, device, site)
-            u = (i + torch.rand(bz, device=device)) / g           # (B,) in (0,1)
+            u = (i + torch.rand(bz, device=device)) / g  # (B,) in (0,1)
         else:
-            i = torch.randperm(bz, device=device).to(torch.float32)   # (B,)
-            u = (i + torch.rand(bz, device=device)) / bz              # (B,)
+            i = torch.randperm(bz, device=device).to(torch.float32)  # (B,)
+            u = (i + torch.rand(bz, device=device)) / bz  # (B,)
         return u.clamp(1e-6, 1 - 1e-6)
 
     def logit_normal_dist(self, bz, device, dtype, site="time"):
@@ -147,14 +157,12 @@ class IMFVideoLoss(nn.Module):
         if self.stratified_time:
             # Stratified draws mapped through the normal quantile function:
             # same logit-normal marginal, far lower batch-statistic variance.
-            u = self._strat_uniform(bz, device, site)            # (B,)
+            u = self._strat_uniform(bz, device, site)  # (B,)
             rnd_normal = (
-                torch.erfinv(2 * u - 1) * (2 ** 0.5)
-            ).reshape(bz, 1, 1, 1, 1).to(dtype)                 # (B,1,1,1,1)
+                (torch.erfinv(2 * u - 1) * (2**0.5)).reshape(bz, 1, 1, 1, 1).to(dtype)
+            )  # (B,1,1,1,1)
         else:
-            rnd_normal = torch.randn(
-                bz, 1, 1, 1, 1, device=device, dtype=dtype
-            )
+            rnd_normal = torch.randn(bz, 1, 1, 1, 1, device=device, dtype=dtype)
         #   rnd_normal: (B, 1, 1, 1, 1) standard normal samples
         return torch.sigmoid(rnd_normal * self.P_std + self.P_mean)
 
@@ -182,7 +190,7 @@ class IMFVideoLoss(nn.Module):
         # never fires. The jittered-quantile rule keeps the exact prefix
         # behaviour in expectation and gives the right proportion on
         # average at any batch size.
-        fm_u = self._strat_uniform(bz, device, "fm_split")     # (B,)
+        fm_u = self._strat_uniform(bz, device, "fm_split")  # (B,)
         fm_mask = (fm_u < self.data_proportion).reshape(bz, 1, 1, 1, 1)
         r = torch.where(fm_mask, t, r)  # (B, 1, 1, 1, 1)
 
@@ -274,6 +282,19 @@ class IMFVideoLoss(nn.Module):
         """
         bz = x.shape[0]
         # The network takes the per-sample scalars flattened to (B,).
+        if self.autocast_bf16 and x.is_cuda:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                u, v = self.net(
+                    x,
+                    t.reshape(bz),
+                    h.reshape(bz),
+                    omega.reshape(bz),
+                    t_min.reshape(bz),
+                    t_max.reshape(bz),
+                    y,
+                )
+            # loss arithmetic stays fp32
+            return u.float(), v.float()
         return self.net(
             x,
             t.reshape(bz),
@@ -298,9 +319,9 @@ class IMFVideoLoss(nn.Module):
         """
         # h = 0 and the full interval [0, 1] are dummies: only the v-head output
         # is read, and the v-head does not depend on the interval conditioning.
-        h = torch.zeros_like(t)      # (B, 1, 1, 1, 1)
+        h = torch.zeros_like(t)  # (B, 1, 1, 1, 1)
         t_min = torch.zeros_like(t)  # (B, 1, 1, 1, 1)
-        t_max = torch.ones_like(t)   # (B, 1, 1, 1, 1)
+        t_max = torch.ones_like(t)  # (B, 1, 1, 1, 1)
 
         v = self.u_fn(x, t, h, omega, t_min, t_max, y=y)[1]  # (B, C, T, H, W)
 
@@ -436,9 +457,9 @@ class IMFVideoLoss(nn.Module):
         #   t, r: (B, 1, 1, 1, 1);  fm_mask: (B, 1, 1, 1, 1) bool
 
         # Linear interpolation path: z_t = (1-t) x + t e, so dz/dt = e - x.
-        e = torch.randn_like(x)      # (B, C, T, H, W) Gaussian noise
-        z_t = (1 - t) * x + t * e    # (B, C, T, H, W) state at time t
-        v_t = e - x                  # (B, C, T, H, W) empirical velocity
+        e = torch.randn_like(x)  # (B, C, T, H, W) Gaussian noise
+        z_t = (1 - t) * x + t * e  # (B, C, T, H, W) state at time t
+        v_t = e - x  # (B, C, T, H, W) empirical velocity
 
         # Sample CFG scale and interval
         t_min, t_max = self.sample_cfg_interval(bz, device, dtype, fm_mask)
@@ -467,7 +488,7 @@ class IMFVideoLoss(nn.Module):
 
         # Tangents: dt/dt = 1 and dr/dt = 0, so the total derivative below is
         # taken with respect to t at fixed r.
-        dtdt = torch.ones_like(t)   # (B, 1, 1, 1, 1)
+        dtdt = torch.ones_like(t)  # (B, 1, 1, 1, 1)
         dtdr = torch.zeros_like(t)  # (B, 1, 1, 1, 1)
 
         # Different from original MeanFlow, we use predicted v in the jvp
@@ -478,17 +499,26 @@ class IMFVideoLoss(nn.Module):
             # forward-mode pass (models/mla_jvp_fast) supplies du/dt with
             # no backward graph at all.
             from models.mla_jvp_fast import (
-                build_fast_jvp_state, model_du_dt_fast,
+                build_fast_jvp_state,
+                model_du_dt_fast,
             )
 
             u, v = u_fn(z_t, t, r)
             #   u, v: (B, C, T, H, W), carry the loss gradient
             with torch.no_grad():
                 state = build_fast_jvp_state(self.net)
-                flat = lambda s: s.reshape(s.shape[0])   # (B,1,1,1,1) -> (B,)
+                flat = lambda s: s.reshape(s.shape[0])  # (B,1,1,1,1) -> (B,)
                 du_dt = model_du_dt_fast(
-                    self.net, state, z_t, flat(t), flat(t - r),
-                    flat(omega), flat(t_min), flat(t_max), labels, v_c,
+                    self.net,
+                    state,
+                    z_t,
+                    flat(t),
+                    flat(t - r),
+                    flat(omega),
+                    flat(t_min),
+                    flat(t_max),
+                    labels,
+                    v_c,
                 )
                 #   du_dt: (B, C, T, H, W), detached by construction
         else:
@@ -622,8 +652,6 @@ class IMFVideoLoss(nn.Module):
         for i in range(t_steps.shape[0] - 1):
             t = t_steps[i].expand(bz).reshape(bz, 1, 1, 1, 1)
             r = t_steps[i + 1].expand(bz).reshape(bz, 1, 1, 1, 1)
-            z_t = self.sample_one_step(
-                z_t, labels, t, r, omega_b, t_min_b, t_max_b
-            )
+            z_t = self.sample_one_step(z_t, labels, t, r, omega_b, t_min_b, t_max_b)
 
         return z_t

@@ -12,10 +12,10 @@ import os
 class ModelConfig:
     # imf_dit_video backbone. Hard cap enforced in train_8gpu.py: <= 300M params.
     # NOTE: Fix these parameters
-    hidden_size: int = 256
+    hidden_size: int = 1024
     depth: int = 19  # total blocks = depth (shared = depth - aux_head_depth)
     aux_head_depth: int = 4  # u-head and v-head each get this many blocks
-    num_heads: int = 4  # head_dim = hidden_size / num_heads = 64 (required)
+    num_heads: int = 16  # head_dim = hidden_size / num_heads = 64 (required)
 
     # NOTE: Fix these parameters
     q_lora_rank: int = 0  # dq: query latent dim, default hidden_size // 2 = 512
@@ -28,7 +28,9 @@ class ModelConfig:
     patch_size: tuple = (1, 2, 2)
     in_channels: int = 16  # Wan2.1 VAE latent channels
     num_classes: int = 1000
-    attn_impl: str = "flash_jvp"  # "flash_jvp" | "sla2_jvp" | "sla2_cube_qat" | "sdpa_flash" | "sdpa"
+    attn_impl: str = (
+        "flash_jvp"  # "flash_jvp" | "sla2_jvp" | "sla2_cube_qat" | "sdpa_flash" | "sdpa"
+    )
     mla_use_output_gate: bool = True
 
     # --- SLA2 sparse-linear attention (attn_impl="sla2_jvp") ---
@@ -110,6 +112,10 @@ class LossConfig:
     norm_eps: float = 0.01
     loss_v_weight: float = 1.0
     jvp_impl: str = "fast"
+    # bf16 autocast for every network forward + backward (fp32 master and
+    # loss math unchanged). Big win on server GPUs whose fp32 rate is far
+    # below tensor-core rate; requires jvp_impl="fast".
+    autocast_bf16: bool = False
     # Stratified (jittered-quantile) sampling of t and r: identical marginal
     # logit-normal law, but each batch covers the whole time range, which is
     # the dominant variance source at small per-step sample counts.

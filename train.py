@@ -382,6 +382,7 @@ def main():
         norm_p=lcfg.norm_p,
         norm_eps=lcfg.norm_eps,
         loss_v_weight=lcfg.loss_v_weight,
+        autocast_bf16=lcfg.autocast_bf16,
     )
 
     o = config.optim
