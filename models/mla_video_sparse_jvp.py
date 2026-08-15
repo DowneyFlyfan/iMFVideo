@@ -39,6 +39,22 @@ __all__ = ["tile_permutation", "route_tiles", "mla_video_sparse_jvp",
 _EPS_L = 1e-5  # linear-branch normalizer epsilon (matches SLA2)
 
 
+def _plenty_of_vram(device, need_gib=24.0):
+    """True when the device has enough FREE memory for the wide (fast)
+    code paths; False selects the serialized low-memory paths that keep
+    a 16 GB consumer card alive beside training.
+
+    Args:
+        device: CUDA device of the tensors in flight.
+        need_gib: free-memory threshold in GiB.
+    """
+    try:
+        free, _ = torch.cuda.mem_get_info(device)
+        return free > need_gib * 2**30
+    except Exception:  # noqa: BLE001 - CPU or query failure: be conservative
+        return False
+
+
 # ---------------------------------------------------------------------------
 # 3D tile permutation: t-major token order -> tile-major order.
 # ---------------------------------------------------------------------------
@@ -321,20 +337,30 @@ def _linear_jvp(qphi, dqphi, kphi, dkphi, v, dv, lut, Np, E):
 
     T = lut.shape[-1]
     idx = lut.long()                                         # (B,H,Mb,T)
-    # accumulate routed-block sums one LUT entry at a time: a single
-    # (B,H,Mb*T,D,Dv) gather is ~0.8 GB at probe batch 8, T=13; the loop
-    # peaks at (B,H,Mb,D,Dv) per term with identical results.
-    gH = torch.zeros(B, H, Mb, D, Dv, device=Hb.device)      # (B,H,Mb,D,Dv)
-    gdH = torch.zeros_like(gH)
-    gz = torch.zeros(B, H, Mb, D, device=Hb.device)          # (B,H,Mb,D)
-    gdz = torch.zeros_like(gz)
-    for j in range(T):
-        ix5 = idx[..., j].view(B, H, Mb, 1, 1).expand(-1, -1, -1, D, Dv)
-        ix4 = idx[..., j].view(B, H, Mb, 1).expand(-1, -1, -1, D)
-        gH += torch.gather(Hb, 2, ix5)
-        gdH += torch.gather(dHb, 2, ix5)
-        gz += torch.gather(zb, 2, ix4)
-        gdz += torch.gather(dzb, 2, ix4)
+    if _plenty_of_vram(Hb.device):
+        # single wide gather: (B,H,Mb*T,D,Dv) transient (~0.8 GB at probe
+        # batch 8) -- fine on data-center GPUs, and one kernel instead of
+        # 4T serial gathers (latency-bound on A100 at T=13).
+        ix5 = idx.view(B, H, Mb * T, 1, 1).expand(-1, -1, -1, D, Dv)
+        ix4 = idx.view(B, H, Mb * T, 1).expand(-1, -1, -1, D)
+        gH = torch.gather(Hb, 2, ix5).view(B, H, Mb, T, D, Dv).sum(3)
+        gdH = torch.gather(dHb, 2, ix5).view(B, H, Mb, T, D, Dv).sum(3)
+        gz = torch.gather(zb, 2, ix4).view(B, H, Mb, T, D).sum(3)
+        gdz = torch.gather(dzb, 2, ix4).view(B, H, Mb, T, D).sum(3)
+    else:
+        # accumulate one LUT entry at a time: peak (B,H,Mb,D,Dv) per term,
+        # identical results -- needed beside training on a 16 GB card.
+        gH = torch.zeros(B, H, Mb, D, Dv, device=Hb.device)  # (B,H,Mb,D,Dv)
+        gdH = torch.zeros_like(gH)
+        gz = torch.zeros(B, H, Mb, D, device=Hb.device)      # (B,H,Mb,D)
+        gdz = torch.zeros_like(gz)
+        for j in range(T):
+            ix5 = idx[..., j].view(B, H, Mb, 1, 1).expand(-1, -1, -1, D, Dv)
+            ix4 = idx[..., j].view(B, H, Mb, 1).expand(-1, -1, -1, D)
+            gH += torch.gather(Hb, 2, ix5)
+            gdH += torch.gather(dHb, 2, ix5)
+            gz += torch.gather(zb, 2, ix4)
+            gdz += torch.gather(dzb, 2, ix4)
 
     H_c = H_all.unsqueeze(2) - gH                            # (B,H,Mb,D,Dv)
     dH_c = dH_all.unsqueeze(2) - gdH

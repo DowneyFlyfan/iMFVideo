@@ -116,11 +116,16 @@ def _attn_sublayer_jvp(h, dh, p, w16, cos, sin, eps):
         from models.sla2_cube_qat import sla2_cube_qat_jvp
         # one batch row at a time: the six tile-major copies plus the
         # linear-branch fp32 states scale with B, and the probe runs this
-        # at B=8 -- per-row processing keeps the peak at the B=1 level.
-        for bi in range(B):
-            # (1, S, H, hd) fp16 views -> (1, H, L, hd) tile-major copies
+        # at B=8 -- per-row processing keeps the peak at the B=1 level on
+        # a 16 GB card. On large-VRAM GPUs the row loop only adds serial
+        # launch latency, so batch rows are grouped there.
+        from models.mla_video_sparse_jvp import _plenty_of_vram
+        row_group = B if _plenty_of_vram(attn.device) else 1
+        for bi in range(0, B, row_group):
+            g = min(row_group, B - bi)  # rows in this group
+            # (g, S, H, hd) fp16 views -> (g, H, L, hd) tile-major copies
             qb, kb, vb, dqb, dkb, dvb = (
-                t[bi:bi + 1].permute(0, 2, 1, 3)[:, :, perm].contiguous()
+                t[bi:bi + g].permute(0, 2, 1, 3)[:, :, perm].contiguous()
                 for t in (qv[:B], kv_[:B], vv[:B],
                           qv[B:], kv_[B:], vv[B:])
             )
@@ -128,10 +133,12 @@ def _attn_sublayer_jvp(h, dh, p, w16, cos, sin, eps):
                 qb, kb, vb, dqb, dkb, dvb, cb["alpha"], cb["topk"],
                 cb["Np"], cb["E"], cb["P"],
                 proj_q=cb["proj_q"], proj_k=cb["proj_k"])
+            #   o_a, do_a: (g, H, L, dv) fp32, tile-major token order
             # back to model token order, into the (B, S, H*dv) fp16 buffer
-            attn[bi] = o_a[0, :, inv].permute(1, 0, 2).reshape(S, H * dv)
-            attn[B + bi] = do_a[0, :, inv].permute(1, 0, 2).reshape(
-                S, H * dv)
+            attn[bi:bi + g] = o_a[:, :, inv].permute(0, 2, 1, 3).reshape(
+                g, S, H * dv)
+            attn[B + bi:B + bi + g] = do_a[:, :, inv].permute(
+                0, 2, 1, 3).reshape(g, S, H * dv)
             del qb, kb, vb, dqb, dkb, dvb, o_a, do_a
     elif "sla2" in p:
         # SLA2 sparse-linear attention JVP (models/sla2_mla_jvp.py):
