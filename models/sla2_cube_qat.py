@@ -600,17 +600,17 @@ def sla2_cube_qat_jvp_fused(q, k, v, dq, dk, dv, alpha, topk_frac, Np, E,
     k8, ks = quantize_qkv(qc[1], E)
     Mb = lut.shape[2]
 
-    # host-side per-tile phi-states (the only remaining torch math):
-    kphi, dkphi = _phi_jvp(k, dk)                            # (B,H,L,D) fp32
-    kb = kphi[:, :, :Np * E].view(B, H, Np, E, D)            # (B,H,Np,E,D)
-    dkb = dkphi[:, :, :Np * E].view(B, H, Np, E, D)
-    vb = v.float()[:, :, :Np * E].view(B, H, Np, E, D)
-    dvb = dv.float()[:, :, :Np * E].view(B, H, Np, E, D)
-    Hb = torch.einsum("bhntd,bhntv->bhndv", kb, vb).contiguous()
-    dHb = (torch.einsum("bhntd,bhntv->bhndv", dkb, vb)
-           + torch.einsum("bhntd,bhntv->bhndv", kb, dvb)).contiguous()
-    zb = kb.sum(3).contiguous()                              # (B,H,Np,D)
-    dzb = dkb.sum(3).contiguous()
+    # per-tile phi-states in one kernel pass (video tiles only)
+    Hb = torch.empty(B, H, Np, D, D, device=q.device, dtype=torch.float32)
+    dHb = torch.empty_like(Hb)
+    zb = torch.empty(B, H, Np, D, device=q.device, dtype=torch.float32)
+    dzb = torch.empty_like(zb)
+    _phi_states_kernel[(Np, B * H)](
+        qc[1], qc[4], qc[2], qc[5], Hb, dHb, zb, dzb,
+        qc[1].stride(0), qc[1].stride(1), qc[1].stride(2),
+        Hb.stride(0), Hb.stride(1), Hb.stride(2),
+        zb.stride(0), zb.stride(1), zb.stride(2),
+        H, L, E=E, D=D, num_warps=4)
     H_all = Hb.sum(2).contiguous()                           # (B,H,D,D)
     dH_all = dHb.sum(2).contiguous()
     z_all = zb.sum(2).contiguous()                           # (B,H,D)
@@ -742,10 +742,11 @@ class _CubeQATFunction(torch.autograd.Function):
             qh, kh, vh, lse, delta_s, do_s, dq_s, lut_aug, scale, T + 1,
             L, M_BLOCKS, D, E, E, num_warps=4, num_stages=4,
         )
-        _attn_bwd_dkdv[(N_BLOCKS, B * H)](
-            qh, kh, vh, do_s, dk_s, dv_s, scale, mask, lse, delta_s,
-            L, M_BLOCKS, N_BLOCKS, D, E, E, BLOCK_SLICE_FACTOR=E // 64,
-            num_warps=4, num_stages=4,
+        kv2q, qcnt = _invert_lut(mask)   # (B,H,Nb,Mb) int32, (B,H,Nb)
+        _sparse_bwd_dkdv_lut[(N_BLOCKS, B * H)](
+            qh, kh, vh, do_s, dk_s, dv_s, scale, kv2q, qcnt, lse, delta_s,
+            L, M_BLOCKS, N_BLOCKS, D=D, BLOCK=E,
+            num_warps=4, num_stages=3,
         )
 
         # ---- linear branch backward (vendored kernels + globals) ----
@@ -760,10 +761,10 @@ class _CubeQATFunction(torch.autograd.Function):
             qphi, kphi, vh, htot, ztot, lut_aug, o_l, den, do_l, dqphi,
             T + 1, L, M_BLOCKS, D, E, E, num_warps=8, num_stages=2,
         )
-        _lin_bwd_dkdv[(N_BLOCKS, B * H)](
-            qphi, kphi, vh, dhtot, dztot, o_l, den, do_l, mask, dkphi,
-            dv_l, L, M_BLOCKS, N_BLOCKS, D, E, E,
-            num_warps=8, num_stages=2,
+        _lin_bwd_dkdv_lut[(N_BLOCKS, B * H)](
+            qphi, kphi, vh, dhtot, dztot, o_l, den, do_l, kv2q, qcnt,
+            dkphi, dv_l, L, M_BLOCKS, N_BLOCKS, D=D, BLOCK=E,
+            num_warps=4, num_stages=3,
         )
 
         # ---- phi (channel softmax) jacobian chains, fused with the add ----
@@ -849,3 +850,188 @@ def _phi_chain_add_kernel(
     dot = tl.sum(phi * dphi, 1)                              # (E,)
     dx = dxs + phi * (dphi - dot[:, None])
     tl.store(DX + ptr, dx.to(DX.dtype.element_ty), mask=mask[:, None])
+
+
+# ---------------------------------------------------------------------------
+# States-build kernel for the fused JVP: per-tile phi-states in one pass.
+# Replaces the host-side phi softmax pair + einsums + sums (~6 ms/call).
+# ---------------------------------------------------------------------------
+@triton.jit
+def _phi_states_kernel(
+    K, DK, V, DV,              # (B, H, L, D) fp16 primal/tangent
+    HB, DHB,                   # (B, H, Np, D, Dv) fp32 out states
+    ZB, DZB,                   # (B, H, Np, D) fp32 out sums
+    s_kb, s_kh, s_ks,          # strides of the (B, H, L, D) inputs
+    s_hb, s_hh, s_hn,          # strides of the (B, H, Np, D, Dv) states
+    s_zb, s_zh, s_zn,          # strides of the (B, H, Np, D) sums
+    H, L,
+    E: tl.constexpr,           # tile length
+    D: tl.constexpr,           # head dim (= Dv)
+):
+    pid_n = tl.program_id(0)                    # video tile id in [0, Np)
+    pid_bh = tl.program_id(1)
+    b = pid_bh // H
+    h = pid_bh % H
+    offs_e = tl.arange(0, E)
+    offs_d = tl.arange(0, D)
+    rows = pid_n * E + offs_e
+    base = b * s_kb + h * s_kh
+    ptr = base + rows[:, None] * s_ks + offs_d[None, :]
+    k = tl.load(K + ptr).to(tl.float32)         # (E, D)
+    dk = tl.load(DK + ptr).to(tl.float32)
+    v = tl.load(V + ptr).to(tl.float32)
+    dv = tl.load(DV + ptr).to(tl.float32)
+
+    # phi = channel softmax with tangent (rows of length D)
+    mx = tl.max(k, 1)
+    ex = tl.exp(k - mx[:, None])
+    den = tl.sum(ex, 1)
+    kphi = ex / den[:, None]                    # (E, D)
+    dot = tl.sum(kphi * dk, 1)
+    dkphi = kphi * (dk - dot[:, None])          # (E, D)
+
+    hb = tl.dot(tl.trans(kphi), v, input_precision="ieee")   # (D, Dv)
+    dhb = (tl.dot(tl.trans(dkphi), v, input_precision="ieee")
+           + tl.dot(tl.trans(kphi), dv, input_precision="ieee"))
+    zb = tl.sum(kphi, 0)                        # (D,)
+    dzb = tl.sum(dkphi, 0)
+
+    hp = (b * s_hb + h * s_hh + pid_n * s_hn
+          + offs_d[:, None] * D + tl.arange(0, D)[None, :])
+    tl.store(HB + hp, hb)
+    tl.store(DHB + hp, dhb)
+    zp = b * s_zb + h * s_zh + pid_n * s_zn + offs_d
+    tl.store(ZB + zp, zb)
+    tl.store(DZB + zp, dzb)
+
+
+# ---------------------------------------------------------------------------
+# LUT-native dkdv backwards: instead of scanning all Mb query blocks per
+# key block with a data-dependent branch (no prefetch), walk the inverted
+# index kv2q directly -- qcnt[n] iterations of straight-line compute.
+# ---------------------------------------------------------------------------
+def _invert_lut(mask):
+    """Invert the block mask into per-key-block query lists.
+
+    Args:
+        mask: (B, H, Mb, Nb) int8 selection mask (1 = query block m attends
+            key block n), from the forward.
+
+    Returns:
+        kv2q: (B, H, Nb, Mb) int32; for each key block n the query-block
+            ids with mask = 1 packed at the front (stable order).
+        qcnt: (B, H, Nb) int32 number of valid entries per key block.
+    """
+    mt = mask.permute(0, 1, 3, 2).bool()                     # (B,H,Nb,Mb)
+    qcnt = mt.sum(-1, dtype=torch.int32)                     # (B,H,Nb)
+    # stable argsort of (not selected): selected blocks sort first, in
+    # ascending query-block order
+    kv2q = torch.argsort(~mt, dim=-1, stable=True).to(torch.int32)
+    return kv2q.contiguous(), qcnt.contiguous()
+
+
+@triton.jit
+def _sparse_bwd_dkdv_lut(
+    Q, K, V, DOS, DK, DV, qk_scale, KV2Q, QCNT, LSE, DELTAS,
+    L, M_BLOCKS, N_BLOCKS,
+    D: tl.constexpr,
+    BLOCK: tl.constexpr,       # BLOCK_M == BLOCK_N == E
+):
+    idx_n = tl.program_id(0).to(tl.int64)
+    idx_bh = tl.program_id(1).to(tl.int64)
+    qkv_off = idx_bh * L * D
+    lse_off = idx_bh * L
+    inv_off = (idx_bh * N_BLOCKS + idx_n) * M_BLOCKS
+
+    offs_n = idx_n * BLOCK + tl.arange(0, BLOCK)
+    offs_m = tl.arange(0, BLOCK)
+    offs_d = tl.arange(0, D)
+    n_mask = offs_n[:, None] < L
+    k = tl.load(K + qkv_off + offs_n[:, None] * D + offs_d[None, :],
+                mask=n_mask, other=0.0)
+    v = tl.load(V + qkv_off + offs_n[:, None] * D + offs_d[None, :],
+                mask=n_mask, other=0.0)
+    dk = tl.zeros([BLOCK, D], dtype=tl.float32)
+    dv = tl.zeros([BLOCK, D], dtype=tl.float32)
+    cnt = tl.load(QCNT + idx_bh * N_BLOCKS + idx_n)
+
+    LOG2E: tl.constexpr = 1.4426950408889634
+    for j in range(0, cnt):
+        m_id = tl.load(KV2Q + inv_off + j).to(tl.int64)
+        rows = m_id * BLOCK + offs_m
+        m_mask = rows < L
+        q = tl.load(Q + qkv_off + rows[:, None] * D + offs_d[None, :],
+                    mask=m_mask[:, None], other=0.0)
+        lse = tl.load(LSE + lse_off + rows, mask=m_mask,
+                      other=float("inf"))
+        qkT = tl.dot(k, tl.trans(q)) * (qk_scale * LOG2E)
+        pT = tl.exp2(qkT - lse[None, :])
+        pT = tl.where(offs_n[:, None] < L, pT, 0.0)
+        do = tl.load(DOS + qkv_off + rows[:, None] * D + offs_d[None, :],
+                     mask=m_mask[:, None], other=0.0)
+        dv += tl.dot(pT.to(do.dtype), do)
+        delta = tl.load(DELTAS + lse_off + rows, mask=m_mask, other=0.0)
+        dpT = tl.dot(v, tl.trans(do))
+        dsT = pT * (dpT - delta[None, :])
+        dk += tl.dot(dsT.to(q.dtype), q)
+
+    tl.store(DK + qkv_off + offs_n[:, None] * D + offs_d[None, :],
+             (dk * qk_scale).to(DK.dtype.element_ty), mask=n_mask)
+    tl.store(DV + qkv_off + offs_n[:, None] * D + offs_d[None, :],
+             dv.to(DV.dtype.element_ty), mask=n_mask)
+
+
+@triton.jit
+def _lin_bwd_dkdv_lut(
+    QPHI, KPHI, V, DHTOT, DZTOT, OL, DEN, DOL, KV2Q, QCNT, DKPHI, DV,
+    L, M_BLOCKS, N_BLOCKS,
+    D: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Complement version: dh starts from the GLOBAL dhtot and subtracts
+    the SELECTED query blocks' contributions (the complement's sum equals
+    global minus selected), then dKphi/dV as in the vendored kernel."""
+    idx_n = tl.program_id(0).to(tl.int64)
+    idx_bh = tl.program_id(1).to(tl.int64)
+    qkv_off = idx_bh * L * D
+    h_off = idx_bh * D * D
+    z_off = idx_bh * D
+    den_off = idx_bh * L
+    inv_off = (idx_bh * N_BLOCKS + idx_n) * M_BLOCKS
+
+    offs_n = idx_n * BLOCK + tl.arange(0, BLOCK)
+    offs_m = tl.arange(0, BLOCK)
+    offs_d = tl.arange(0, D)
+    offs_e = tl.arange(0, D)
+    dh = tl.load(DHTOT + h_off + offs_d[:, None] * D + offs_e[None, :]
+                 ).to(tl.float32)
+    dz = tl.load(DZTOT + z_off + offs_d).to(tl.float32)
+    cnt = tl.load(QCNT + idx_bh * N_BLOCKS + idx_n)
+
+    for j in range(0, cnt):
+        m_id = tl.load(KV2Q + inv_off + j).to(tl.int64)
+        rows = m_id * BLOCK + offs_m
+        m_mask = rows < L
+        qp = tl.load(QPHI + qkv_off + rows[:, None] * D + offs_d[None, :],
+                     mask=m_mask[:, None], other=0.0)
+        dol = tl.load(DOL + qkv_off + rows[:, None] * D + offs_e[None, :],
+                      mask=m_mask[:, None], other=0.0)
+        ol = tl.load(OL + qkv_off + rows[:, None] * D + offs_e[None, :],
+                     mask=m_mask[:, None], other=0.0)
+        den = tl.load(DEN + den_off + rows, mask=m_mask, other=1.0)
+        g = dol.to(tl.float32) / den[:, None]
+        s_r = tl.sum(dol.to(tl.float32) * ol.to(tl.float32), 1) / den
+        dh -= tl.dot(tl.trans(qp), g.to(qp.dtype)).to(tl.float32)
+        dz += tl.sum(qp.to(tl.float32) * s_r[:, None], 0)
+
+    n_mask = offs_n[:, None] < L
+    kp = tl.load(KPHI + qkv_off + offs_n[:, None] * D + offs_d[None, :],
+                 mask=n_mask, other=0.0)
+    vv = tl.load(V + qkv_off + offs_n[:, None] * D + offs_e[None, :],
+                 mask=n_mask, other=0.0)
+    dkp = tl.dot(vv, tl.trans(dh).to(vv.dtype)).to(tl.float32) + dz[None, :]
+    dv = tl.dot(kp, dh.to(kp.dtype)).to(tl.float32)
+    tl.store(DKPHI + qkv_off + offs_n[:, None] * D + offs_d[None, :],
+             dkp.to(DKPHI.dtype.element_ty), mask=n_mask)
+    tl.store(DV + qkv_off + offs_n[:, None] * D + offs_e[None, :],
+             dv.to(DV.dtype.element_ty), mask=n_mask)

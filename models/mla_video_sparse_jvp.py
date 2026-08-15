@@ -548,7 +548,9 @@ def route_tiles_fast(q, k, topk_frac, Np, E, prefix_len,
         k, kb, k.stride(0), k.stride(1), k.stride(2),
         kb.stride(0), kb.stride(1), kb.stride(2),
         H, Np * E, Np * E, E=E, D=D, num_warps=4)
-    kb = kb - kb.mean(2, keepdim=True)          # smooth-k
+    # smooth-k (subtracting the mean pooled key) shifts every score row by
+    # a per-query constant q_m . mu, which cannot change the row-wise hard
+    # top-k order -- dropped here (it only matters for SOFT routing).
     if proj_q is not None:
         qb = qb @ proj_q.t().to(qb.dtype)
     if proj_k is not None:
