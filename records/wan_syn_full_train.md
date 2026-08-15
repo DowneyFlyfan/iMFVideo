@@ -25,3 +25,13 @@
 - Curve: `records/wan_syn_full_train_loss.png`; raw series `records/wan_syn_full_train_history.json`.
 
 - Not directly comparable to the crop-run records: different token count, per-step sample count (2 vs 8), and data distribution (full 480p latents vs 16x16 crops).
+
+## Full-dataset 4x A100 launch parameters (2026-08-16)
+
+- Data: entire Wan-Syn (111,016 videos, streaming-converted, fixed 2k normalization stats). Model: 264.7M server config (hidden 1024, depth 19, heads 16, MLA, attn sla2_cube_qat topk 0.03, tile-major residency, INT8 QAT sparse forward, bf16 autocast, TF32).
+
+- Parameters from README + records: lr 6e-4 (README K-rule: 0.3 * 2e-3 at K = 550k), P_std 0.8 (PT round winner), token/embedding init constants 32 = sqrt(d) (verified MuP table), Muon-branch lr x sqrt(256/1024) = 0.5 (verified width rule, per-group multiplier in train.py), warmup 860 (2.5% of steps), decay_fraction 0.2 (1-sqrt), WSD.
+
+- Batch: measured max bs 6/GPU (60.3 GiB peak; bs 8 OOM); chosen bs 4/GPU (global 16, 34,375 steps for K = 550k). The R2/R3 "steps beat batch" caution was traced to decay-step starvation (160 steps); at 6,875 decay steps it does not apply, and bs 4 cuts wall clock ~30% vs bs 1.
+
+- Kernel state at launch: cube-QAT training op 3.48-3.50x faster than dense flash at d=1024 (records/sla2_cube_qat.md campaign table); Moonlight per-shape NS coefficients from the committed disk cache.
