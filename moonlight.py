@@ -39,6 +39,7 @@ Shape symbols used below:
 """
 
 import math
+import os
 
 import torch
 
@@ -167,8 +168,28 @@ def get_ns_coefficients(n, m, steps, mode="per_shape", verbose=False, **solve_kw
     n, m = min(n, m), max(n, m)
     key = (n, m, steps)
     if key not in _COEFF_CACHE:
+        # Optional disk cache (MOONLIGHT_COEFF_CACHE=path.json): the CPU
+        # solve (32 SVDs + 3000 Adam iters per shape) takes minutes on a
+        # desktop but can hang for hours on cgroup-throttled cluster CPUs,
+        # so coefficients are solved once locally and shipped with the code.
+        cache_path = os.environ.get("MOONLIGHT_COEFF_CACHE")
+        if cache_path and os.path.exists(cache_path):
+            import json
+
+            disk = json.load(open(cache_path))
+            skey = f"{n}x{m}x{steps}"
+            if skey in disk:
+                _COEFF_CACHE[key] = tuple(disk[skey])
+                return _COEFF_CACHE[key]
         coeffs, mse = solve_ns_coefficients(n, m, steps=steps, **solve_kw)
         _COEFF_CACHE[key] = coeffs
+        if cache_path:
+            import json
+
+            disk = (json.load(open(cache_path))
+                    if os.path.exists(cache_path) else {})
+            disk[f"{n}x{m}x{steps}"] = list(coeffs)
+            json.dump(disk, open(cache_path, "w"), indent=1)
         if verbose:
             # Baseline MSE using Jordan's fixed triple, for comparison.
             print(
