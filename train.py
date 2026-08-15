@@ -87,6 +87,12 @@ def resolve_device():
         (device, backend): torch.device and the process-group backend name.
     """
     if torch.cuda.is_available():
+        # TF32 tensor-core GEMMs for all fp32 matmuls: on A100 this is the
+        # difference between 19.5 (CUDA cores) and 156 TFLOPS. Attention
+        # already runs bf16/fp16 internally, so TF32 (10-bit mantissa) on
+        # the Linear layers matches the repo's precision philosophy.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         return torch.device("cuda"), "nccl"
     if torch.backends.mps.is_available():
         return torch.device("mps"), "gloo"
