@@ -462,7 +462,10 @@ def main():
 
         lr = lr_at(step)
         for g in optimizer.param_groups:
-            g["lr"] = lr
+            # per-group width factor (records/mup_special_layers.md): the
+            # Muon branch under Moonlight's Adjust-LR needs lr * sqrt(d0/d)
+            # when widening past the tuned d0=256; AdamW groups keep 1.
+            g["lr"] = lr * g.get("lr_width_mult", 1.0)
         grad_norm = torch.nn.utils.clip_grad_norm_(net.parameters(), o.grad_clip)
         optimizer.step()
         if ema is not None:
