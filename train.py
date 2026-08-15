@@ -388,6 +388,41 @@ def main():
     o = config.optim
     assert o.grad_accum >= 1, "grad_accum must be at least 1"
     optimizer = build_optimizer(net, o, device, verbose=rank == 0)
+    # Per-LAYER-CLASS lr width factors (records/mup_special_layers.md,
+    # verified by width coordinate checks), applied by splitting the two
+    # Moonlight groups on parameter names:
+    #   Muon hidden matrices / router projs  : sqrt(d0/d)
+    #   Muon res score heads (LM-Head class) : d0/d
+    #   AdamW output projections (u/v final) : d0/d
+    #   AdamW Theta(1) classes (embeddings, tokens, gains, gates, alpha): 1
+    ratio = config.model.hidden_size / 256.0        # d / d0
+    name_of = {id(pp): nn for nn, pp in net.named_parameters()}
+    new_groups = []
+    for g in optimizer.param_groups:
+        buckets = {}
+        for pp in g["params"]:
+            nm = name_of.get(id(pp), "")
+            if g.get("use_muon") and "_res_proj" in nm:
+                mult = 1.0 / ratio                  # res score heads
+            elif g.get("use_muon"):
+                mult = ratio ** -0.5                # hidden matrices
+            elif "final_layer" in nm and ".norm." not in nm:
+                mult = 1.0 / ratio                  # output projections
+            else:
+                mult = 1.0                          # Theta(1) classes
+            buckets.setdefault(mult, []).append(pp)
+        for mult, ps in buckets.items():
+            ng = {k: v for k, v in g.items() if k != "params"}
+            ng["params"] = ps
+            ng["lr_width_mult"] = mult
+            new_groups.append(ng)
+    optimizer.param_groups = new_groups
+    if rank == 0:
+        for ng in new_groups:
+            print(f"lr group: muon={ng.get('use_muon', False)} "
+                  f"mult={ng['lr_width_mult']:.3f} "
+                  f"params={sum(pp.numel() for pp in ng['params'])/1e6:.2f}M",
+                  flush=True)
 
     dataset = LatentDataset(config.data)
     sampler = (
