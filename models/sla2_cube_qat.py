@@ -318,6 +318,13 @@ class SLA2CubeQATAttentionImpl(nn.Module):
         self.register_buffer("perm", perm, persistent=False)   # (L,)
         self.register_buffer("inv", inv, persistent=False)     # (L,)
         self.Mb = self.Np + 1                                  # + prefix tail
+        # a_index: (L,) int64, tile-major token row -> query-block id
+        # (E-sized video blocks, then the prefix tail block Mb-1); used by
+        # the fused alpha mix in _CubeQATFunction.
+        rows = torch.arange(seq_len)
+        self.register_buffer(
+            "a_index", torch.clamp(rows // self.E, max=self.Mb - 1),
+            persistent=False)
         self.Nb = math.ceil(seq_len / self.E)                  # key blocks
         # learnable router projections (identity init, SLA2 style): (D, D)
         self.proj_q = nn.Parameter(torch.eye(head_dim))
@@ -356,13 +363,10 @@ class SLA2CubeQATAttentionImpl(nn.Module):
             q.requires_grad or k.requires_grad or v.requires_grad
             or self.alpha_logit.requires_grad)
         if needs_grad:
-            o_s = _sparse_attention_qat.apply(qh, kh, vh, mask, lut_aug,
-                                              T + 1, self.E, self.E,
-                                              self.use_int8)
-            qphi = torch.softmax(qh.float(), -1).half().contiguous()
-            kphi = torch.softmax(kh.float(), -1).half().contiguous()
-            o_l = _complement_linear_attention.apply(
-                qphi, kphi, vh, mask, lut_aug, T + 1, self.E, self.E)
+            o = _CubeQATFunction.apply(qh, kh, vh, self.alpha_logit, lut,
+                                       lut_aug, mask, T, self.E,
+                                       self.use_int8, self.a_index)
+            return o[:, :, self.inv].permute(0, 2, 1, 3).to(q.dtype)
         else:
             # guidance path (no_grad): primal-only JVP kernel (int8 primal
             # scores, no tangent loads/dots) + states-based linear branch;
@@ -600,3 +604,144 @@ def sla2_cube_qat_jvp_fused(q, k, v, dq, dk, dv, alpha, topk_frac, Np, E,
         num_warps=8, num_stages=1,
     )
     return o, do
+
+
+# ---------------------------------------------------------------------------
+# Whole-op autograd Function: direct kernel calls for both branches, phi
+# fused into the sparse forward (phi_out), analytic backward for the phi
+# chains and the alpha mix. Removes the python-autograd glue (separate phi
+# softmax fwd/bwd, alpha interleave fwd/bwd, double contexts) that
+# dominated the training fwd+bwd of the module path.
+# ---------------------------------------------------------------------------
+from models.sla2_vendor.kernel_sparse_qat import _attn_fwd_qat  # noqa: E402
+from models.sla2_vendor.sla_kernel import (  # noqa: E402
+    _attn_bwd_dkdv,
+    _attn_bwd_dq,
+    _attn_bwd_preprocess,
+)
+from models.sla2_vendor.kernel_linear import (  # noqa: E402
+    _lin_bwd_dkdv,
+    _lin_bwd_dq,
+    _lin_fwd2,
+    _precompute_global,
+)
+
+
+class _CubeQATFunction(torch.autograd.Function):
+    """o = a .* O_s(q,k,v) + (1-a) .* O_l(phi(q),phi(k),v), tile-major.
+
+    Saved tensors and their shapes are annotated inline; all inputs are
+    (B, H, L, D) fp16 contiguous in tile-major token order.
+    """
+
+    @staticmethod
+    def forward(ctx, qh, kh, vh, alpha_logit, lut, lut_aug, mask, T, E,
+                use_int8, a_index):
+        # qh/kh/vh: (B,H,L,D) fp16;  alpha_logit: (H,Mb) fp32 logits
+        # lut: (B,H,Mb,T) video tiles; lut_aug: (B,H,Mb,T+1) with prefix
+        # mask: (B,H,Mb,Nb) int8; a_index: (L,) int64 row->block map
+        B, H, L, D = qh.shape
+        M_BLOCKS = triton.cdiv(L, E)
+        scale = D ** -0.5
+
+        o_s = torch.empty_like(vh)                          # (B,H,L,D)
+        lse = torch.empty(B, H, L, device=qh.device, dtype=torch.float32)
+        qphi = torch.empty_like(qh)                         # (B,H,L,D)
+        _attn_fwd_qat[(M_BLOCKS, B * H)](
+            qh, kh, vh, lut_aug, lse, o_s, qphi,
+            scale, T + 1, L, M_BLOCKS, D, E, E, use_int8, True,
+            num_warps=4, num_stages=3,
+        )
+        kphi = torch.softmax(kh.float(), -1).to(qh.dtype).contiguous()
+
+        htot, ztot = _precompute_global(qphi, kphi, vh)     # (B,H,D,D),(B,H,D)
+        o_l = torch.empty_like(vh)                          # (B,H,L,D)
+        den = torch.empty(B, H, L, device=qh.device, dtype=torch.float32)
+        # complement must exclude the prefix tail too (the globals span all
+        # L tokens): use the augmented LUT with T+1 entries.
+        _lin_fwd2[(M_BLOCKS, B * H)](
+            qphi, kphi, vh, htot.to(qh.dtype).contiguous(), ztot, lut_aug,
+            o_l, den, o_l, ztot, o_l,
+            T + 1, L, M_BLOCKS, D, E, E, False, False, T + 1 <= 4,
+            num_warps=8, num_stages=3,
+        )
+
+        a_row = torch.sigmoid(alpha_logit.float())          # (H, Mb)
+        a = a_row[:, a_index].view(1, H, L, 1).to(o_s.dtype)  # (1,H,L,1)
+        o = a * o_s + (1.0 - a) * o_l                       # (B,H,L,D)
+
+        ctx.save_for_backward(qh, kh, vh, alpha_logit, lut, lut_aug, mask,
+                              lse, o_s, o_l, den, qphi, kphi, htot, ztot,
+                              a_index)
+        ctx.T, ctx.E, ctx.scale = T, E, scale
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        (qh, kh, vh, alpha_logit, lut, lut_aug, mask, lse, o_s, o_l, den,
+         qphi, kphi, htot, ztot, a_index) = ctx.saved_tensors
+        T, E, scale = ctx.T, ctx.E, ctx.scale
+        B, H, L, D = qh.shape
+        M_BLOCKS = triton.cdiv(L, E)
+        N_BLOCKS = triton.cdiv(L, E)
+        do = do.contiguous()
+
+        a_row = torch.sigmoid(alpha_logit.float())          # (H, Mb)
+        a = a_row[:, a_index].view(1, H, L, 1)              # (1,H,L,1) fp32
+        dof = do.float()
+        # d/d alpha_logit: sum over rows of block mb of do.(o_s - o_l),
+        # times sigmoid'(logit) = a(1-a)
+        diff = (dof * (o_s.float() - o_l.float())).sum((0, 3))  # (H, L)
+        Mb = a_row.shape[1]
+        seg = torch.zeros(H, Mb, device=do.device)
+        seg.index_add_(1, a_index, diff)                    # (H, Mb)
+        d_alpha = seg * a_row * (1.0 - a_row)               # (H, Mb)
+
+        do_s = (dof * a).to(do.dtype).contiguous()          # (B,H,L,D)
+        do_l = (dof * (1.0 - a)).to(do.dtype).contiguous()
+
+        # ---- sparse branch backward (vendored SLA kernels) ----
+        dq_s = torch.empty_like(qh)
+        dk_s = torch.empty_like(kh)
+        dv_s = torch.empty_like(vh)
+        delta_s = torch.empty_like(lse)
+        _attn_bwd_preprocess[(M_BLOCKS, B * H)](o_s, do_s, delta_s, L, D, E)
+        _attn_bwd_dq[(M_BLOCKS, B * H)](
+            qh, kh, vh, lse, delta_s, do_s, dq_s, lut_aug, scale, T + 1,
+            L, M_BLOCKS, D, E, E, num_warps=4, num_stages=4,
+        )
+        _attn_bwd_dkdv[(N_BLOCKS, B * H)](
+            qh, kh, vh, do_s, dk_s, dv_s, scale, mask, lse, delta_s,
+            L, M_BLOCKS, N_BLOCKS, D, E, E, BLOCK_SLICE_FACTOR=E // 64,
+            num_warps=4, num_stages=4,
+        )
+
+        # ---- linear branch backward (vendored kernels + globals) ----
+        g = do_l.float() / den[..., None]                   # (B,H,L,D)
+        s = (do_l.float() * o_l.float()).sum(-1) / den      # (B,H,L)
+        dhtot = (qphi.float().transpose(-1, -2) @ g).contiguous()
+        dztot = -(qphi.float() * s[..., None]).sum(-2).contiguous()
+        dqphi = torch.empty_like(qphi)
+        dkphi = torch.empty_like(kphi)
+        dv_l = torch.empty_like(vh)
+        _lin_bwd_dq[(M_BLOCKS, B * H)](
+            qphi, kphi, vh, htot, ztot, lut_aug, o_l, den, do_l, dqphi,
+            T + 1, L, M_BLOCKS, D, E, E, num_warps=8, num_stages=2,
+        )
+        _lin_bwd_dkdv[(N_BLOCKS, B * H)](
+            qphi, kphi, vh, dhtot, dztot, o_l, den, do_l, mask, dkphi,
+            dv_l, L, M_BLOCKS, N_BLOCKS, D, E, E,
+            num_warps=8, num_stages=2,
+        )
+
+        # ---- phi (channel softmax) jacobian chains ----
+        qpf, dqpf = qphi.float(), dqphi.float()
+        dq_phi = qpf * (dqpf - (qpf * dqpf).sum(-1, keepdim=True))
+        kpf, dkpf = kphi.float(), dkphi.float()
+        dk_phi = kpf * (dkpf - (kpf * dkpf).sum(-1, keepdim=True))
+
+        dq = dq_s + dq_phi.to(do.dtype)
+        dk = dk_s + dk_phi.to(do.dtype)
+        dv = dv_s + dv_l
+        return (dq, dk, dv, d_alpha, None, None, None, None, None, None,
+                None)
