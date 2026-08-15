@@ -890,9 +890,10 @@ def _phi_states_kernel(
     dot = tl.sum(kphi * dk, 1)
     dkphi = kphi * (dk - dot[:, None])          # (E, D)
 
-    hb = tl.dot(tl.trans(kphi), v, input_precision="ieee")   # (D, Dv)
-    dhb = (tl.dot(tl.trans(dkphi), v, input_precision="ieee")
-           + tl.dot(tl.trans(kphi), dv, input_precision="ieee"))
+    # tf32 dots: the states feed the linear-branch quotient, whose
+    # overall tolerance is ~1e-3; ieee fp32 dots measured 3x slower here.
+    hb = tl.dot(tl.trans(kphi), v)                           # (D, Dv)
+    dhb = tl.dot(tl.trans(dkphi), v) + tl.dot(tl.trans(kphi), dv)
     zb = tl.sum(kphi, 0)                        # (D,)
     dzb = tl.sum(dkphi, 0)
 

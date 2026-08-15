@@ -41,3 +41,21 @@
 - Remaining gap (cube 14.7 s vs dense 9.7 s): per-block TORCH-LEVEL machinery around the kernels -- 3x permute+gather to tile order, router pooling + top-k, mask scatter, channel-softmax phi in fp32, states einsums, alpha interleave, inverse permute -- roughly 60 ms x 23 blocks per forward-equivalent, executed 4-5x per step. Dense bf16 flash runs ONE fused kernel per block at ~70% MFU; the cube composite runs ~15 separate memory-bound ops. The 5.5x theory assumed equal hardware efficiency per FLOP; the measured effective MFU of the cube composite is ~8-10%.
 
 - Consequence: the cube advantage is real where the baseline's non-attention stack is slow (fp32 linears: 1.44x end-to-end at d=256) and where attention dominates FLOPs at matched MFU. Closing the gap at d=1024-bf16 requires fusing permute+quant+route+sparse+linear+mix into 1-2 kernels (the VSA paper's ThunderKittens approach, 85% MFU) -- a dedicated kernel-engineering project, out of scope for this pass.
+
+## Kernel optimization campaign: 3x over dense attention reached (2026-08)
+
+- Target (user): the cube-QAT attention kernel 3x faster than dense attention at d=1024 during training. Measured at the training-op level (fwd+bwd plus the forward-mode JVP op, B=1, H=16, L=29,138, D=64, idle A100):
+
+| stage | dense | cube | ratio |
+|---|---|---|---|
+| baseline (start of campaign) | 139.7 ms | 200.4 ms | 0.70x |
+| + fused JVP kernel (phi + complement states + quotient + alpha in-program) | 139.7 | 150 | 0.93x |
+| + whole-op autograd Function (direct kernels, analytic backward) | 140 | 60 | 2.33x |
+| + tile-major residency (one permute per model forward, bit-exact) | 140 | ~60 | 2.33x (op); step 14.7 -> 12.2 s |
+| + LUT-native dkdv backwards + phi-states kernel (tf32) + smooth-k removal | 139.3-140.0 | **40.0** | **3.48-3.50x** |
+
+- Final per-phase: fwd 10.0 ms (dense 29.7, 3.0x), fwd+bwd 30.0 (dense 80, 2.7x), JVP 11.5 (dense 60, 5.2x).
+
+- Full-step core (interleaved medians, guidance + fwd_bwd + du/dt): dense 7930 ms vs cube 8949 ms -- the gradient path (fwd_bwd 3050 vs 3747) and du/dt (1206 vs 1495) are FASTER than dense; the remaining deficit is entirely the guidance pair of no-grad forwards (4693 vs 2689), which pays per-block routing + branch overheads 46 times per step. Closing it needs either a per-step routing cache (not bit-exact, unapproved) or route+mix fusion into the vendored forward kernel.
+
+- Correctness at every stage: forward vs old path 9e-7; gradients within fp16 kernel noise (<= 8e-3); tile-major residency bit-exact (0.0 on u, v, du/dt); router selection invariant to the smooth-k removal (per-row constant score shift cannot change hard top-k; agreement 1.0000).
