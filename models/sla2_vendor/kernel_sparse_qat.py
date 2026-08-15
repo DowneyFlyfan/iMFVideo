@@ -96,8 +96,11 @@ def _attn_fwd_qat(
         alpha = tl.exp2(m_i - new_m)
         o_s = o_s * alpha[:, None]
 
-        if USE_INT8:
-            # P in [0, 1]; V quantized per key block
+        if USE_INT8 and BLOCK_N >= 32:
+            # P in [0, 1]; V quantized per key block. int8 MMA needs the
+            # inner dim (BLOCK_N) >= 32; for smaller tiles (e.g. E = 16
+            # cube tiles) the PV dot falls back to fp16 while the QK score
+            # dot stays int8 -- matching the JVP kernel's semantics.
             p_i8 = (p * 127.0 + 0.5).to(tl.int8)
             sv = tl.max(tl.abs(v.to(tl.float32))) / 127.0 + 1e-12
             v_i8 = (v.to(tl.float32) / sv + 0.5 * tl.where(v.to(tl.float32) >= 0, 1.0, -1.0)).to(tl.int8)

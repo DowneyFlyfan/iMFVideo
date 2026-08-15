@@ -324,7 +324,8 @@ class SLA2CubeQATAttentionImpl(nn.Module):
             grid, tile, self.prefix_len, torch.device("cpu"))
         self.register_buffer("perm", perm, persistent=False)   # (L,)
         self.register_buffer("inv", inv, persistent=False)     # (L,)
-        self.Mb = self.Np + 1                                  # + prefix tail
+        self.n_tail = -(-self.prefix_len // self.E)  # prefix tail blocks
+        self.Mb = self.Np + self.n_tail
         # a_index: (L,) int64, tile-major token row -> query-block id
         # (E-sized video blocks, then the prefix tail block Mb-1); used by
         # the fused alpha mix in _CubeQATFunction.
@@ -366,9 +367,12 @@ class SLA2CubeQATAttentionImpl(nn.Module):
                                       self.E, self.prefix_len,
                                       proj_q=self.proj_q,
                                       proj_k=self.proj_k)
-        # append the ragged prefix tail block as an always-selected entry
-        tail = torch.full_like(lut[..., :1], self.Nb - 1)      # (B,H,Mb,1)
-        lut_aug = torch.cat([lut, tail], dim=-1).contiguous()  # (B,H,Mb,T+1)
+        # append the ragged prefix tail block(s) as always-selected entries
+        tail_ids = torch.arange(self.Np, self.Np + self.n_tail,
+                                device=q.device, dtype=lut.dtype)
+        tail = tail_ids.view(1, 1, 1, -1).expand(
+            lut.shape[0], lut.shape[1], lut.shape[2], -1)  # (B,H,Mb,n_tail)
+        lut_aug = torch.cat([lut, tail], dim=-1).contiguous()
         # dense {0,1} block mask for the backward kernels: (B,H,Mb,Nb)
         mask = torch.zeros(B, H, self.Mb, self.Nb, device=q.device,
                            dtype=torch.int8)
@@ -380,7 +384,8 @@ class SLA2CubeQATAttentionImpl(nn.Module):
         if needs_grad:
             o = _CubeQATFunction.apply(qh, kh, vh, self.alpha_logit, lut,
                                        lut_aug, mask, T, self.E,
-                                       self.use_int8, self.a_index)
+                                       self.use_int8, self.a_index,
+                                       self.n_tail)
             if self.pre_permuted:
                 return o.permute(0, 2, 1, 3).to(q.dtype)
             return o[:, :, self.inv].permute(0, 2, 1, 3).to(q.dtype)
@@ -396,7 +401,7 @@ class SLA2CubeQATAttentionImpl(nn.Module):
             qphi = torch.empty_like(qh)                       # (B,H,L,D)
             _attn_fwd_qat[(M_BLOCKS, B_ * H_)](
                 qh, kh, vh, lut_aug, lse, o_s, qphi,
-                D_ ** -0.5, T + 1, L_, M_BLOCKS, D_, self.E, self.E,
+                D_ ** -0.5, T + self.n_tail, L_, M_BLOCKS, D_, self.E, self.E,
                 self.use_int8, True, num_warps=4, num_stages=3,
             )
             kphi = torch.softmax(kh.float(), -1).to(qh.dtype).contiguous()
@@ -407,11 +412,16 @@ class SLA2CubeQATAttentionImpl(nn.Module):
             _lin_fwd2[(M_BLOCKS, B_ * H_)](
                 qphi, kphi, vh, htot.to(qh.dtype).contiguous(), ztot,
                 lut_aug, o_l, den, o_l, ztot, o_l,
-                T + 1, L_, M_BLOCKS, D_, self.E, self.E, False, False,
-                T + 1 <= 4, num_warps=8, num_stages=3,
+                T + self.n_tail, L_, M_BLOCKS, D_, self.E, self.E,
+                False, False, T + self.n_tail <= 4,
+                num_warps=8, num_stages=3,
             )
 
-        reps = [self.E] * self.Np + [self.prefix_len]
+        # token counts per query block: Np full video tiles, then the
+        # prefix split into n_tail blocks (last one ragged)
+        tail_sizes = [self.E] * (self.n_tail - 1) + [
+            self.prefix_len - (self.n_tail - 1) * self.E]
+        reps = [self.E] * self.Np + tail_sizes
         a = torch.sigmoid(self.alpha_logit).repeat_interleave(
             torch.tensor(reps, device=q.device), dim=-1)       # (H, L)
         a = a.view(1, H, L, 1).to(o_s.dtype)
@@ -448,7 +458,8 @@ def _cube_fused_jvp_kernel(
     s_ab,                      # stride of the (H, Mb) alpha rows
     H, L, T, NPE, scale, eps_l,
     HEAD_DIM: tl.constexpr,    # D = Dv = 64
-    BLOCK: tl.constexpr,       # E = 64: query tile = key tile = quant block
+    BLOCK: tl.constexpr,       # E: query tile = key tile = quant block
+    N_TAIL: tl.constexpr,      # ceil(P / E) always-attended prefix blocks
 ):
     pid_m = tl.program_id(0)               # query block id (= LUT row mb)
     pid_bh = tl.program_id(1)
@@ -503,9 +514,10 @@ def _cube_fused_jvp_kernel(
     zb_base = ZB + b * s_zbb + h * s_zbh
     dzb_base = DZB + b * s_zbb + h * s_zbh
 
-    for j in range(0, T + 1):
-        if j == T:
-            nb_id = NPE // BLOCK           # ragged prefix tail block id
+    for j in range(0, T + N_TAIL):
+        if j >= T:
+            # ragged prefix tail block(s), always attended
+            nb_id = NPE // BLOCK + (j - T)
         else:
             nb_id = tl.load(lut_base + j)
         offs = nb_id * BLOCK + offs_n      # key token rows
@@ -635,6 +647,7 @@ def sla2_cube_qat_jvp_fused(q, k, v, dq, dk, dv, alpha, topk_frac, Np, E,
         af.stride(0),
         H, L, T, Np * E, scale, _EPS_L,
         HEAD_DIM=D, BLOCK=E,
+        N_TAIL=-(-prefix_len // E),
         num_warps=8, num_stages=1,
     )
     return o, do
@@ -670,7 +683,7 @@ class _CubeQATFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, qh, kh, vh, alpha_logit, lut, lut_aug, mask, T, E,
-                use_int8, a_index):
+                use_int8, a_index, n_tail=1):
         # qh/kh/vh: (B,H,L,D) fp16;  alpha_logit: (H,Mb) fp32 logits
         # lut: (B,H,Mb,T) video tiles; lut_aug: (B,H,Mb,T+1) with prefix
         # mask: (B,H,Mb,Nb) int8; a_index: (L,) int64 row->block map
@@ -683,7 +696,7 @@ class _CubeQATFunction(torch.autograd.Function):
         qphi = torch.empty_like(qh)                         # (B,H,L,D)
         _attn_fwd_qat[(M_BLOCKS, B * H)](
             qh, kh, vh, lut_aug, lse, o_s, qphi,
-            scale, T + 1, L, M_BLOCKS, D, E, E, use_int8, True,
+            scale, T + n_tail, L, M_BLOCKS, D, E, E, use_int8, True,
             num_warps=4, num_stages=3,
         )
         kphi = torch.softmax(kh.float(), -1).to(qh.dtype).contiguous()
@@ -696,8 +709,8 @@ class _CubeQATFunction(torch.autograd.Function):
         _lin_fwd2[(M_BLOCKS, B * H)](
             qphi, kphi, vh, htot.to(qh.dtype).contiguous(), ztot, lut_aug,
             o_l, den, o_l, ztot, o_l,
-            T + 1, L, M_BLOCKS, D, E, E, False, False, T + 1 <= 4,
-            num_warps=8, num_stages=3,
+            T + n_tail, L, M_BLOCKS, D, E, E, False, False,
+            T + n_tail <= 4, num_warps=8, num_stages=3,
         )
 
         a_row = torch.sigmoid(alpha_logit.float())          # (H, Mb)
@@ -708,6 +721,7 @@ class _CubeQATFunction(torch.autograd.Function):
                               lse, o_s, o_l, den, qphi, kphi, htot, ztot,
                               a_index)
         ctx.T, ctx.E, ctx.scale = T, E, scale
+        ctx.n_tail = n_tail
         return o
 
     @staticmethod
@@ -715,6 +729,7 @@ class _CubeQATFunction(torch.autograd.Function):
         (qh, kh, vh, alpha_logit, lut, lut_aug, mask, lse, o_s, o_l, den,
          qphi, kphi, htot, ztot, a_index) = ctx.saved_tensors
         T, E, scale = ctx.T, ctx.E, ctx.scale
+        n_tail = ctx.n_tail
         B, H, L, D = qh.shape
         M_BLOCKS = triton.cdiv(L, E)
         N_BLOCKS = triton.cdiv(L, E)
@@ -739,8 +754,8 @@ class _CubeQATFunction(torch.autograd.Function):
         delta_s = torch.empty_like(lse)
         _attn_bwd_preprocess[(M_BLOCKS, B * H)](o_s, do_s, delta_s, L, D, E)
         _attn_bwd_dq[(M_BLOCKS, B * H)](
-            qh, kh, vh, lse, delta_s, do_s, dq_s, lut_aug, scale, T + 1,
-            L, M_BLOCKS, D, E, E, num_warps=4, num_stages=4,
+            qh, kh, vh, lse, delta_s, do_s, dq_s, lut_aug, scale,
+            T + n_tail, L, M_BLOCKS, D, E, E, num_warps=4, num_stages=4,
         )
         kv2q, qcnt = _invert_lut(mask)   # (B,H,Nb,Mb) int32, (B,H,Nb)
         _sparse_bwd_dkdv_lut[(N_BLOCKS, B * H)](
@@ -759,7 +774,7 @@ class _CubeQATFunction(torch.autograd.Function):
         dv_l = torch.empty_like(vh)
         _lin_bwd_dq[(M_BLOCKS, B * H)](
             qphi, kphi, vh, htot, ztot, lut_aug, o_l, den, do_l, dqphi,
-            T + 1, L, M_BLOCKS, D, E, E, num_warps=8, num_stages=2,
+            T + n_tail, L, M_BLOCKS, D, E, E, num_warps=8, num_stages=2,
         )
         _lin_bwd_dkdv_lut[(N_BLOCKS, B * H)](
             qphi, kphi, vh, dhtot, dztot, o_l, den, do_l, kv2q, qcnt,
@@ -781,7 +796,7 @@ class _CubeQATFunction(torch.autograd.Function):
             H, L, E=E, D=D, num_warps=4)
         dv = dv_s + dv_l
         return (dq, dk, dv, d_alpha, None, None, None, None, None, None,
-                None)
+                None, None)
 
 
 # ---------------------------------------------------------------------------

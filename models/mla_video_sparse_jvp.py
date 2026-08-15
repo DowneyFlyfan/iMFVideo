@@ -255,8 +255,13 @@ def _pool_tiles(x, Np, E, prefix_cnt):
     xf = x.float()
     xc = xf[:, :, :Np * E].view(B, H, Np, E, D).mean(3)      # (B,H,Np,D)
     if prefix_cnt:
-        xt = xf[:, :, Np * E:].mean(2, keepdim=True)         # (B,H,1,D)
-        xc = torch.cat([xc, xt], dim=2)                      # (B,H,Np+1,D)
+        # prefix occupies ceil(P/E) tail blocks of up to E tokens each
+        n_tail = -(-prefix_cnt // E)
+        tails = []
+        for j in range(n_tail):
+            seg = xf[:, :, Np * E + j * E: Np * E + (j + 1) * E]
+            tails.append(seg.mean(2, keepdim=True))          # (B,H,1,D)
+        xc = torch.cat([xc] + tails, dim=2)                  # (B,H,Mb,D)
     return xc
 
 
@@ -536,7 +541,7 @@ def route_tiles_fast(q, k, topk_frac, Np, E, prefix_len,
         (lut, T): (B, H, Mb, T) int32 video-tile ids and the topk count.
     """
     B, H, L, D = q.shape
-    Mb = Np + (1 if prefix_len else 0)
+    Mb = Np + (-(-prefix_len // E) if prefix_len else 0)
     qb = torch.empty(B, H, Mb, D, device=q.device, dtype=torch.float32)
     kb = torch.empty(B, H, Np, D, device=q.device, dtype=torch.float32)
     grid = lambda nb: (nb, B * H)
