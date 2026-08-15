@@ -69,6 +69,7 @@ def _sla2_cube_jvp_qat_kernel(
     HEAD_DIM: tl.constexpr,    # D = Dv
     BLOCK: tl.constexpr,       # E = 64: query tile = key tile = quant block
     FP16_MMA: tl.constexpr,
+    WITH_TANGENT: tl.constexpr,  # False: primal only (guidance no-grad path)
 ):
     pid_m = tl.program_id(0)               # query block id (= LUT row mb)
     pid_bh = tl.program_id(1)
@@ -85,8 +86,11 @@ def _sla2_cube_jvp_qat_kernel(
     qp = base + offs_m[:, None] * s_qs + offs_d[None, :]
     q8 = tl.load(Q8 + qp, mask=mask_m[:, None], other=0)     # int8
     sq = tl.load(QS + sbase + pid_m)                          # fp32 scalar
-    dq = tl.load(DQ + qp, mask=mask_m[:, None], other=0.0)   # fp16
     qf = tl.load(Q + qp, mask=mask_m[:, None], other=0.0)    # fp16
+    if WITH_TANGENT:
+        dq = tl.load(DQ + qp, mask=mask_m[:, None], other=0.0)  # fp16
+    else:
+        dq = qf  # unused; keeps the type checker happy
 
     m_i = tl.full([BLOCK], float("-inf"), tl.float32)
     l_i = tl.zeros([BLOCK], tl.float32)
@@ -108,49 +112,98 @@ def _sla2_cube_jvp_qat_kernel(
         k8 = tl.load(K8 + kp, mask=mask_n[:, None], other=0)  # int8
         sk = tl.load(KS + sbase + nb_id)                      # fp32 scalar
         kf = tl.load(K + kp, mask=mask_n[:, None], other=0.0)
-        dk = tl.load(DK + kp, mask=mask_n[:, None], other=0.0)
+        if WITH_TANGENT:
+            dk = tl.load(DK + kp, mask=mask_n[:, None], other=0.0)
 
         # primal scores on INT8 operands (int32 accumulate), dequantized
         s_f = tl.dot(q8, tl.trans(k8), out_dtype=tl.int32).to(tl.float32)
         s_f = s_f * (sq * sk)
         # tangent scores fp16: dQ K^T + Q dK^T
-        if FP16_MMA:
-            ds = (tl.dot(dq, tl.trans(kf), out_dtype=tl.float16).to(tl.float32)
-                  + tl.dot(qf, tl.trans(dk),
-                           out_dtype=tl.float16).to(tl.float32)) * scale
-        else:
-            ds = (tl.dot(dq, tl.trans(kf)) + tl.dot(qf, tl.trans(dk))) * scale
+        if WITH_TANGENT:
+            if FP16_MMA:
+                ds = (tl.dot(dq, tl.trans(kf),
+                             out_dtype=tl.float16).to(tl.float32)
+                      + tl.dot(qf, tl.trans(dk),
+                               out_dtype=tl.float16).to(tl.float32)) * scale
+            else:
+                ds = (tl.dot(dq, tl.trans(kf))
+                      + tl.dot(qf, tl.trans(dk))) * scale
         s2 = tl.where(mask_n[None, :], s_f * (scale * LOG2E), float("-inf"))
 
         m_new = tl.maximum(m_i, tl.max(s2, 1))
         alpha = tl.math.exp2(m_i - m_new)
         p = tl.math.exp2(s2 - m_new[:, None])
-        t = p * ds
 
         l_i = l_i * alpha + tl.sum(p, 1)
-        mu_i = mu_i * alpha + tl.sum(t, 1)
-
         v = tl.load(V + kp, mask=mask_n[:, None], other=0.0)
-        dv = tl.load(DV + kp, mask=mask_n[:, None], other=0.0)
-        if FP16_MMA:
-            pc = p.to(tl.float16)
-            tc = t.to(tl.float16)
-            o_t = tl.dot(pc, v, out_dtype=tl.float16).to(tl.float32)
-            do_t = (tl.dot(tc, v, out_dtype=tl.float16)
-                    + tl.dot(pc, dv, out_dtype=tl.float16)).to(tl.float32)
+        if WITH_TANGENT:
+            t = p * ds
+            mu_i = mu_i * alpha + tl.sum(t, 1)
+            dv = tl.load(DV + kp, mask=mask_n[:, None], other=0.0)
+            if FP16_MMA:
+                pc = p.to(tl.float16)
+                tc = t.to(tl.float16)
+                o_t = tl.dot(pc, v, out_dtype=tl.float16).to(tl.float32)
+                do_t = (tl.dot(tc, v, out_dtype=tl.float16)
+                        + tl.dot(pc, dv,
+                                 out_dtype=tl.float16)).to(tl.float32)
+            else:
+                o_t = tl.dot(p, v)
+                do_t = tl.dot(t, v) + tl.dot(p, dv)
+            acc_do = acc_do * alpha[:, None] + do_t
         else:
-            o_t = tl.dot(p, v)
-            do_t = tl.dot(t, v) + tl.dot(p, dv)
+            if FP16_MMA:
+                o_t = tl.dot(p.to(tl.float16), v,
+                             out_dtype=tl.float16).to(tl.float32)
+            else:
+                o_t = tl.dot(p, v)
         acc_o = acc_o * alpha[:, None] + o_t
-        acc_do = acc_do * alpha[:, None] + do_t
         m_i = m_new
 
     o = acc_o / l_i[:, None]
-    do = acc_do / l_i[:, None] - (mu_i / l_i)[:, None] * o
-
     op = b * s_ob + h * s_oh + offs_m[:, None] * s_os + offs_d[None, :]
     tl.store(O + op, o.to(O.dtype.element_ty), mask=mask_m[:, None])
-    tl.store(DO + op, do.to(DO.dtype.element_ty), mask=mask_m[:, None])
+    if WITH_TANGENT:
+        do = acc_do / l_i[:, None] - (mu_i / l_i)[:, None] * o
+        tl.store(DO + op, do.to(DO.dtype.element_ty), mask=mask_m[:, None])
+
+
+@torch.no_grad()
+def _sparse_primal_only(q, k, v, lut, T, Np, E, prefix_len):
+    """Primal-only sparse branch: int8 scores, no tangent loads/dots.
+
+    Serves the guidance no-grad forwards, where the vendored autograd
+    kernels' backward bookkeeping is wasted work.
+
+    Args:
+        q, k, v: (B, H, L, D) fp16, tile-major token order.
+        lut: (B, H, Mb, T) int32 routed VIDEO-tile ids (prefix appended
+            in-kernel via the T+1-th iteration).
+        T: routed tile count;  Np, E, prefix_len: tiling geometry.
+
+    Returns:
+        o_s: (B, H, L, D) fp32 sparse-branch output.
+    """
+    B, H, L, D = q.shape
+    scale = D ** -0.5
+    qc = [t.contiguous().half() for t in (q, k, v)]
+    q8, qs = quantize_qkv(qc[0], E)     # int8 (B,H,L,D) + (B,H,NB) scales
+    k8, ks = quantize_qkv(qc[1], E)
+    Mb = lut.shape[2]
+    o = torch.empty(B, H, L, D, device=q.device, dtype=torch.float32)
+    grid = (Mb, B * H)
+    _sla2_cube_jvp_qat_kernel[grid](
+        qc[0], qc[1], qc[2], qc[0], qc[0], qc[0],  # tangent ptrs unused
+        q8, k8, qs, ks, o, o, lut,                 # DO ptr unused
+        qc[0].stride(0), qc[0].stride(1), qc[0].stride(2),
+        o.stride(0), o.stride(1), o.stride(2),
+        lut.stride(0), lut.stride(1), lut.stride(2),
+        qs.stride(0), qs.stride(1),
+        H, L, T, Np * E, scale,
+        HEAD_DIM=D, BLOCK=E, FP16_MMA=True, WITH_TANGENT=False,
+        num_warps=4, num_stages=2,
+    )
+    return o
 
 
 def sla2_cube_qat_jvp(q, k, v, dq, dk, dv, alpha, topk_frac, Np, E,
@@ -198,7 +251,7 @@ def sla2_cube_qat_jvp(q, k, v, dq, dk, dv, alpha, topk_frac, Np, E,
         lut.stride(0), lut.stride(1), lut.stride(2),
         qs.stride(0), qs.stride(1),
         H, L, T, NPE, scale,
-        HEAD_DIM=D, BLOCK=E, FP16_MMA=True,
+        HEAD_DIM=D, BLOCK=E, FP16_MMA=True, WITH_TANGENT=True,
         num_warps=4, num_stages=2,
     )
 
@@ -299,12 +352,29 @@ class SLA2CubeQATAttentionImpl(nn.Module):
                            dtype=torch.int8)
         mask.scatter_(-1, lut_aug.long(), 1)
 
-        o_s = _sparse_attention_qat.apply(qh, kh, vh, mask, lut_aug, T + 1,
-                                          self.E, self.E, self.use_int8)
-        qphi = torch.softmax(qh.float(), -1).half().contiguous()  # (B,H,L,D)
-        kphi = torch.softmax(kh.float(), -1).half().contiguous()
-        o_l = _complement_linear_attention.apply(
-            qphi, kphi, vh, mask, lut_aug, T + 1, self.E, self.E)
+        needs_grad = torch.is_grad_enabled() and (
+            q.requires_grad or k.requires_grad or v.requires_grad
+            or self.alpha_logit.requires_grad)
+        if needs_grad:
+            o_s = _sparse_attention_qat.apply(qh, kh, vh, mask, lut_aug,
+                                              T + 1, self.E, self.E,
+                                              self.use_int8)
+            qphi = torch.softmax(qh.float(), -1).half().contiguous()
+            kphi = torch.softmax(kh.float(), -1).half().contiguous()
+            o_l = _complement_linear_attention.apply(
+                qphi, kphi, vh, mask, lut_aug, T + 1, self.E, self.E)
+        else:
+            # guidance path (no_grad): primal-only JVP kernel (int8 primal
+            # scores, no tangent loads/dots) + states-based linear branch;
+            # ~2x leaner than the autograd kernels.
+            o_s = _sparse_primal_only(qh, kh, vh, lut, T, self.Np, self.E,
+                                      self.prefix_len)        # (B,H,L,D)
+            qphi, _ = _phi_jvp(qh, qh)                        # (B,H,L,D)
+            kphi, _ = _phi_jvp(kh, kh)
+            zeros = torch.zeros_like(qphi)
+            o_l, _ = _linear_jvp(qphi, zeros, kphi, zeros,
+                                 vh, torch.zeros_like(vh), lut,
+                                 self.Np, self.E)             # (B,H,L,D)
 
         reps = [self.E] * self.Np + [self.prefix_len]
         a = torch.sigmoid(self.alpha_logit).repeat_interleave(
