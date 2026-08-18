@@ -23,3 +23,19 @@
 - step 3900: loss_u 0.4636, loss_u_ema 0.5009, grad_norm 0.684. step 3950: all quantities nan (loss, loss_u, loss_u_ema, loss_v, grad_norm). Single 50-step window from healthy to full NaN, no preceding grad_norm ramp, lr constant 8e-4 (stable phase).
 
 - No checkpoint existed (ckpt_every 5000, first save would have been step 5000). Run killed at step 3950; log archived as `train_full_nan3950.log` on the pod.
+
+## Root cause (stress-battery forensics, 2026-08-18)
+
+- Reproduction: with unit-scale random inputs the op is clean, but scaling q, k (and for some channels v or the tangents) by only ~20x makes fwd/bwd/JVP emit inf/nan while every observable one logging window earlier is healthy -- matching the step 3900 -> 3950 cliff with no grad_norm ramp. Battery: scratch `stress_nan.py`, cases per tensor and jointly at x10/20/30/50/70/100, bf16 autocast on and off.
+
+- Four independent numeric channels, all triggered by attention logit / feature growth during training (no qk-norm in the model):
+
+- Channel 1 (the likely killer): backward kernels recompute p = exp2(fp16 scores - lse) but lse comes from the INT8-quantized forward. The quantization mismatch grows with logit scale, the exponent goes spuriously positive, and the fp16 cast of p (and of ds = p(dp - delta)) becomes inf -> whole rows of dk/dv/dq -> all-reduce spreads it to every rank -> optimizer step poisons all weights -> next forward prints loss=nan. Fixed by clamping the exponent at +4 (true p <= 1, so inert when healthy) plus saturating the fp16 casts in `_sparse_bwd_dkdv_lut`, `_attn_bwd_dq`, `_attn_bwd_dkdv`.
+
+- Channel 2: linear branch, den = phi(q) z + eps_l bottoms out at eps_l = 1e-5 when the phi channel a query selects has no global mass (phi saturates one-hot at large features); g = dOl/den ~ 1e5-1e7 then overflowed the fp16 dqphi/dkphi/dv buffers. Fixed with fp32 grad buffers, saturated g/dh casts, and a clamp before the final fp16 grad cast (clip_grad_norm bounds the magnitude afterwards).
+
+- Channel 3: fused JVP linear-branch denominator used plain +eps_l while the complement state zc = ztot - routed can cancel slightly negative in fp32, letting den cross zero -> nan. Fixed with the vendored signed-epsilon form (|den| >= eps_l, sign kept), which `_lin_fwd2` already used.
+
+- Channel 4: fused JVP score-tangent dots and the P V accumulation used out_dtype=float16 (fp16 accumulate) and overflow at 65504 once primals and tangents are jointly ~20x -- the same class as the 66a4e5b fp16 output-cast NaN. Fixed with fp32 accumulate (same HMMA tensor-core rate on A100) and a saturated fp16 cast of the tangent operand.
+
+- After the fixes the entire battery is finite in fwd, bwd and JVP up to x100 (only 1000-sigma inputs that overflow the fp16 input tensors themselves remain non-finite), and `test_e16` passes with fused-vs-module rel 4e-4. Fix commit 933f227; run 2 hot-swapped onto the fixed kernels at its step-1000 checkpoint via config.run.resume.
