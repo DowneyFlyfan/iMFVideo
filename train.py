@@ -129,7 +129,7 @@ def build_model():
         attn = partial(
             SLA2CubeQATAttentionImpl,
             grid=(config.data.latent_frames // pt, lh // ph, lw // pw),
-            tile=(4, 4, 4),
+            tile=m.sla2_tile,
             topk=m.sla2_topk,
             alpha_init=m.sla2_alpha_init,
         )
@@ -502,9 +502,20 @@ def main():
             # when widening past the tuned d0=256; AdamW groups keep 1.
             g["lr"] = lr * g.get("lr_width_mult", 1.0)
         grad_norm = torch.nn.utils.clip_grad_norm_(net.parameters(), o.grad_clip)
-        optimizer.step()
-        if ema is not None:
-            ema_update(ema, net, config.run.ema_decay)
+        # grad_norm: () scalar, total pre-clip L2 norm over all parameter grads.
+        # Non-finite => this batch produced inf/nan somewhere in backward; the
+        # grads are identical on every rank (all-reduce above), so every rank
+        # skips the same step and stays in sync. Skipping keeps the weights and
+        # EMA finite instead of poisoning the run (Wan2.2 run 1 died this way
+        # at step 3950 with no checkpoint, records/wan22_full_train.md).
+        if torch.isfinite(grad_norm):
+            optimizer.step()
+            if ema is not None:
+                ema_update(ema, net, config.run.ema_decay)
+        else:
+            optimizer.zero_grad(set_to_none=True)
+            if rank == 0:
+                print(f"step {step + 1}: non-finite grad_norm, step skipped")
         step += 1
 
         if rank == 0 and step % config.run.log_every == 0:
@@ -517,9 +528,12 @@ def main():
                 / dt
             )
             lu = dict_losses["loss_u"].item()
-            loss_u_ema = lu if loss_u_ema is None else (
-                ema_beta * loss_u_ema + (1 - ema_beta) * lu
-            )
+            # lu: python float, last micro-batch loss_u. A non-finite value
+            # would poison the displayed EMA forever; keep the EMA finite.
+            if loss_u_ema is None:
+                loss_u_ema = lu
+            elif math.isfinite(lu):
+                loss_u_ema = ema_beta * loss_u_ema + (1 - ema_beta) * lu
             print(
                 f"step {step} loss={loss_sum:.4f} "
                 f"loss_u={lu:.4f} loss_u_ema={loss_u_ema:.4f} "
