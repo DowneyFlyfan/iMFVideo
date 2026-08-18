@@ -127,6 +127,10 @@ def _lin_bwd_dq(
 
     g = dol.to(tl.float32) / den[:, None]                                    # (BLOCK_M, D)
     s = tl.sum(dol.to(tl.float32) * ol.to(tl.float32), axis=1) / den         # (BLOCK_M,)
+    # den bottoms out at eps_l when the phi channel a query selects has no
+    # global mass (one-hot phi at large logits); g then reaches ~1/eps_l and
+    # the fp16 cast below turns it into inf. Saturate: healthy g is O(10).
+    g = tl.clamp(g, -60000.0, 60000.0)
 
     dq = tl.dot(g.to(dol.dtype), tl.trans(h).to(dol.dtype)).to(tl.float32)
     dq -= s[:, None] * z[None, :]

@@ -167,12 +167,18 @@ def _attn_bwd_dq(
         k = tl.load(K_ptrs + idx_n * BLOCK_N * D, mask=n_mask[:, None])
         v = tl.load(V_ptrs + idx_n * BLOCK_N * D, mask=n_mask[:, None])
         qk = tl.dot(q, k.T) * (qk_scale * 1.4426950408889634)  # = 1 / ln(2)
-        p = tl.exp2(qk - lse[:, None])
+        # lse may come from the INT8 forward while qk is the fp16 recompute;
+        # clamp the exponent (true p <= 1) so the quantization mismatch at
+        # large logits cannot overflow the fp16 ds cast below.
+        p = tl.exp2(tl.minimum(qk - lse[:, None], 4.0))
         p = tl.where(n_mask[None, :], p, 0.0)
 
         # Compute dP and dS.
         dp = tl.dot(do_s, v.T).to(tl.float32)
         ds = p * (dp - delta_s[:, None])
+        # Saturate before the fp16 cast: |ds| can exceed 65504 when large
+        # logits (mismatch-inflated p) meet large v; inf here poisons dq.
+        ds = tl.clamp(ds, -60000.0, 60000.0)
         # Compute dQ.
         dq += tl.dot(ds.to(k.dtype), k)
     tl.store(DQ_ptrs, dq * qk_scale, mask=offs_m[:, None] < L)
@@ -234,7 +240,9 @@ def _attn_bwd_dkdv(
             q = tl.load(Q_ptrs, mask=m_mask[:, None])
             lse = tl.load(LSE_ptrs, mask=m_mask, other=float("inf"))
             qkT = tl.dot(k, q.T) * (qk_scale * 1.4426950408889634)  # = 1 / ln(2)
-            pT = tl.exp2(qkT - lse[None, :])
+            # Same INT8-forward / fp16-recompute mismatch guard as
+            # _attn_bwd_dq: true p <= 1, clamp keeps the fp16 casts finite.
+            pT = tl.exp2(tl.minimum(qkT - lse[None, :], 4.0))
             pT = tl.where(offs_n[:, None] < L, pT, 0.0)
 
             do = tl.load(DOS_ptrs, mask=m_mask[:, None])
@@ -244,6 +252,8 @@ def _attn_bwd_dkdv(
             # Compute dP and dS.
             dpT = tl.dot(v, tl.trans(do))
             dsT = pT * (dpT - delta[None, :])
+            # Saturate before the fp16 cast (see _attn_bwd_dq).
+            dsT = tl.clamp(dsT, -60000.0, 60000.0)
             dk += tl.dot(dsT.to(q.dtype), q)
 
         # Increment pointers

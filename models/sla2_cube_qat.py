@@ -530,9 +530,12 @@ def _cube_fused_jvp_kernel(
 
         s_f = tl.dot(q8, tl.trans(k8), out_dtype=tl.int32).to(tl.float32)
         s_f = s_f * (sq * sk)
-        ds = (tl.dot(dq, tl.trans(kf), out_dtype=tl.float16).to(tl.float32)
-              + tl.dot(qf, tl.trans(dk),
-                       out_dtype=tl.float16).to(tl.float32)) * scale
+        # fp32 accumulate: the fp16-accumulated dot overflowed at 65504 when
+        # primals and tangents are jointly large (score tangents reach 1e4+),
+        # the same class as the fp16 output-cast NaN fixed in 66a4e5b. Same
+        # tensor-core rate on A100 (HMMA fp16-in/fp32-acc).
+        ds = (tl.dot(dq, tl.trans(kf), out_dtype=tl.float32)
+              + tl.dot(qf, tl.trans(dk), out_dtype=tl.float32)) * scale
         s2 = tl.where(mask_n[None, :], s_f * (scale * LOG2E), float("-inf"))
 
         m_new = tl.maximum(m_i, tl.max(s2, 1))
@@ -545,10 +548,13 @@ def _cube_fused_jvp_kernel(
         v = tl.load(V + kp, mask=mask_n[:, None], other=0.0)
         dv = tl.load(DV + kp, mask=mask_n[:, None], other=0.0)
         pc = p.to(tl.float16)
-        tc = t.to(tl.float16)
-        o_t = tl.dot(pc, v, out_dtype=tl.float16).to(tl.float32)
-        do_t = (tl.dot(tc, v, out_dtype=tl.float16)
-                + tl.dot(pc, dv, out_dtype=tl.float16)).to(tl.float32)
+        # t = p * ds carries the score tangent (reaches 1e4+ when primals and
+        # tangents are jointly large); saturate its fp16 MMA operand and
+        # accumulate in fp32 so the products stay finite.
+        tc = tl.clamp(t, -60000.0, 60000.0).to(tl.float16)
+        o_t = tl.dot(pc, v, out_dtype=tl.float32)
+        do_t = (tl.dot(tc, v, out_dtype=tl.float32)
+                + tl.dot(pc, dv, out_dtype=tl.float32))
         acc_o = acc_o * alpha_c[:, None] + o_t
         acc_do = acc_do * alpha_c[:, None] + do_t
         m_i = m_new
@@ -569,7 +575,12 @@ def _cube_fused_jvp_kernel(
     # ---- linear branch quotient (per query row) ----
     num = tl.dot(qphi, hc)                                   # (BLOCK, Dv)
     dnum = tl.dot(dqphi, hc) + tl.dot(qphi, dhc)             # (BLOCK, Dv)
-    den = tl.sum(qphi * zc[None, :], 1) + eps_l              # (BLOCK,)
+    # zc is a complement state (global minus routed); fp32 cancellation can
+    # push it negative, and a plain "+ eps_l" then lets den cross zero and
+    # nan the quotient. Signed epsilon (|den| >= eps_l, sign preserved)
+    # matches the vendored _lin_fwd2 exactly.
+    den = tl.sum(qphi * zc[None, :], 1)                      # (BLOCK,)
+    den = tl.where(den >= 0, den + eps_l, den - eps_l)
     dden = tl.sum(dqphi * zc[None, :], 1) + tl.sum(qphi * dzc[None, :], 1)
     o_l = num / den[:, None]                                 # (BLOCK, Dv)
     do_l = (dnum - o_l * dden[:, None]) / den[:, None]
@@ -769,9 +780,13 @@ class _CubeQATFunction(torch.autograd.Function):
         s = (do_l.float() * o_l.float()).sum(-1) / den      # (B,H,L)
         dhtot = (qphi.float().transpose(-1, -2) @ g).contiguous()
         dztot = -(qphi.float() * s[..., None]).sum(-2).contiguous()
-        dqphi = torch.empty_like(qphi)
-        dkphi = torch.empty_like(kphi)
-        dv_l = torch.empty_like(vh)
+        # fp32 grad buffers: dqphi = g @ h^T - s z^T reaches ~1/eps_l * |h|
+        # when a one-hot phi channel has no global mass (large-logit regime);
+        # fp16 buffers here overflowed to inf and poisoned Wan2.2 run 1.
+        # The kernels' .to(element_ty) stores adapt to the buffer dtype.
+        dqphi = torch.empty_like(qphi, dtype=torch.float32)
+        dkphi = torch.empty_like(kphi, dtype=torch.float32)
+        dv_l = torch.empty_like(vh, dtype=torch.float32)
         _lin_bwd_dq[(M_BLOCKS, B * H)](
             qphi, kphi, vh, htot, ztot, lut_aug, o_l, den, do_l, dqphi,
             T + n_tail, L, M_BLOCKS, D, E, E, num_warps=8, num_stages=2,
@@ -794,7 +809,10 @@ class _CubeQATFunction(torch.autograd.Function):
             kphi, dkphi, dk_s, dk,
             kphi.stride(0), kphi.stride(1), kphi.stride(2),
             H, L, E=E, D=D, num_warps=4)
-        dv = dv_s + dv_l
+        # dv_l is fp32 (see buffer note above); saturate the sum before the
+        # fp16 grad cast autograd requires — one-hot-phi rows can carry
+        # ~1/eps_l magnitudes that clip_grad_norm will bound after.
+        dv = (dv_s.float() + dv_l).clamp_(-60000.0, 60000.0).to(vh.dtype)
         return (dq, dk, dv, d_alpha, None, None, None, None, None, None,
                 None, None)
 
@@ -864,6 +882,10 @@ def _phi_chain_add_kernel(
     dxs = tl.load(DXS + ptr, mask=mask[:, None], other=0.0).to(tl.float32)
     dot = tl.sum(phi * dphi, 1)                              # (E,)
     dx = dxs + phi * (dphi - dot[:, None])
+    # dphi can legitimately reach ~1/eps_l in the empty-phi-channel regime;
+    # saturate so the fp16 store stays finite (grad clip then bounds the
+    # step). Healthy dx is O(1).
+    dx = tl.clamp(dx, -60000.0, 60000.0)
     tl.store(DX + ptr, dx.to(DX.dtype.element_ty), mask=mask[:, None])
 
 
@@ -981,7 +1003,13 @@ def _sparse_bwd_dkdv_lut(
         lse = tl.load(LSE + lse_off + rows, mask=m_mask,
                       other=float("inf"))
         qkT = tl.dot(k, tl.trans(q)) * (qk_scale * LOG2E)
-        pT = tl.exp2(qkT - lse[None, :])
+        # lse was computed by the INT8 forward while qkT here is the fp16
+        # recompute; at large logits the quantization mismatch makes the
+        # exponent spuriously positive and pT overflows the fp16 cast below
+        # (inf rows in dk/dv poisoned Wan2.2 run 1 at step 3950). True
+        # p <= 1, so clamping the exponent at +4 (pT <= 16) is inert in the
+        # healthy regime and bounds the mismatch regime.
+        pT = tl.exp2(tl.minimum(qkT - lse[None, :], 4.0))
         pT = tl.where(offs_n[:, None] < L, pT, 0.0)
         do = tl.load(DOS + qkv_off + rows[:, None] * D + offs_d[None, :],
                      mask=m_mask[:, None], other=0.0)
@@ -989,6 +1017,8 @@ def _sparse_bwd_dkdv_lut(
         delta = tl.load(DELTAS + lse_off + rows, mask=m_mask, other=0.0)
         dpT = tl.dot(v, tl.trans(do))
         dsT = pT * (dpT - delta[None, :])
+        # Saturate before the fp16 cast (see the pT clamp above).
+        dsT = tl.clamp(dsT, -60000.0, 60000.0)
         dk += tl.dot(dsT.to(q.dtype), q)
 
     tl.store(DK + qkv_off + offs_n[:, None] * D + offs_d[None, :],
@@ -1036,6 +1066,10 @@ def _lin_bwd_dkdv_lut(
                      mask=m_mask[:, None], other=0.0)
         den = tl.load(DEN + den_off + rows, mask=m_mask, other=1.0)
         g = dol.to(tl.float32) / den[:, None]
+        # den ~ eps_l when a one-hot phi channel has no global mass; the
+        # fp16 cast of g below would inf. Healthy g is O(10) (see
+        # kernel_linear._lin_bwd_dq).
+        g = tl.clamp(g, -60000.0, 60000.0)
         s_r = tl.sum(dol.to(tl.float32) * ol.to(tl.float32), 1) / den
         dh -= tl.dot(tl.trans(qp), g.to(qp.dtype)).to(tl.float32)
         dz += tl.sum(qp.to(tl.float32) * s_r[:, None], 0)
@@ -1045,6 +1079,8 @@ def _lin_bwd_dkdv_lut(
                  mask=n_mask, other=0.0)
     vv = tl.load(V + qkv_off + offs_n[:, None] * D + offs_e[None, :],
                  mask=n_mask, other=0.0)
+    # dh accumulates g-scaled dots; saturate before its fp16 casts.
+    dh = tl.clamp(dh, -60000.0, 60000.0)
     dkp = tl.dot(vv, tl.trans(dh).to(vv.dtype)).to(tl.float32) + dz[None, :]
     dv = tl.dot(kp, dh.to(kp.dtype)).to(tl.float32)
     tl.store(DKPHI + qkv_off + offs_n[:, None] * D + offs_d[None, :],
