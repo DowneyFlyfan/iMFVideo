@@ -39,3 +39,15 @@
 - Channel 4: fused JVP score-tangent dots and the P V accumulation used out_dtype=float16 (fp16 accumulate) and overflow at 65504 once primals and tangents are jointly ~20x -- the same class as the 66a4e5b fp16 output-cast NaN. Fixed with fp32 accumulate (same HMMA tensor-core rate on A100) and a saturated fp16 cast of the tangent operand.
 
 - After the fixes the entire battery is finite in fwd, bwd and JVP up to x100 (only 1000-sigma inputs that overflow the fp16 input tensors themselves remain non-finite), and `test_e16` passes with fused-vs-module rel 4e-4. Fix commit 933f227; run 2 hot-swapped onto the fixed kernels at its step-1000 checkpoint via config.run.resume.
+
+## Run 3 (fixed kernels, from scratch): backward-NaN stall at step ~3500
+
+- Run 2's step-1000 checkpoint was corrupted (hot-swap script killed the run mid torch.save); run 3 restarted from scratch on the fixed kernels 2026-08-18. Curve identical to runs 1-2 through step ~3400 (loss_u_ema 1.55 at 100 -> 0.50 at 3350), zero skip events.
+
+- From step 3504 the non-finite grad_norm guard began firing and by ~3700 it fired on ~90% of steps: 3,740 skips between steps 3504 and 7653. Forward stayed finite the whole time (loss_u 0.48-0.66, printed grad_norm=nan), so the NaN arises in backward only; the guard held the weights finite but loss_u_ema stayed flat at ~0.52-0.55 for 4,000 steps -- no learning after step ~3600. Same onset step as run 1's death (3950), now survived instead of fatal.
+
+- Interpretation: the clamps close the inf channels they cover, but nan is still produced upstream (e.g. 0 x inf when a saturated p multiplies an fp16-accumulated dp that overflowed; tl.clamp propagates nan). The recurrence at the same training depth on two runs shows the root cause is model-level unbounded attention-logit / phi-feature growth (the MLA q/k path has no qk-norm); kernel patching alone cannot be made robust to it.
+
+- The pod was rescheduled a third time (hd7nz -> gwcjg) around step 7653, killing the stalled process. Checkpoints step_0001000-0007000.pt exist (3.5 GB each, CephFS); post-3600 checkpoints carry essentially frozen weights, so step_0003000/step_0004000 represent the learning achieved.
+
+- Pending decision: add qk-RMSNorm to the MLA q/k path (architecture change) and restart, vs. config-only lr reduction resume. Not launched pending user approval.
