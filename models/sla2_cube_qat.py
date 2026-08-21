@@ -382,10 +382,18 @@ class SLA2CubeQATAttentionImpl(nn.Module):
             q.requires_grad or k.requires_grad or v.requires_grad
             or self.alpha_logit.requires_grad)
         if needs_grad:
+            # logit_max_log2: (H,) fp32, per-head max over (B, L) of the
+            # sparse-branch lse (log2 domain, scores pre-folded with
+            # qk_scale * log2 e). Upper-bounds the per-head MaxLogit within
+            # log2(L) bits; read by the QK-Clip step in train.py
+            # (kexue.fm/archives/11126). Filled fresh every training forward.
+            if not hasattr(self, "logit_max_log2"):
+                self.logit_max_log2 = torch.zeros(
+                    qh.shape[1], device=qh.device, dtype=torch.float32)
             o = _CubeQATFunction.apply(qh, kh, vh, self.alpha_logit, lut,
                                        lut_aug, mask, T, self.E,
                                        self.use_int8, self.a_index,
-                                       self.n_tail)
+                                       self.n_tail, self.logit_max_log2)
             if self.pre_permuted:
                 return o.permute(0, 2, 1, 3).to(q.dtype)
             return o[:, :, self.inv].permute(0, 2, 1, 3).to(q.dtype)
@@ -694,10 +702,12 @@ class _CubeQATFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, qh, kh, vh, alpha_logit, lut, lut_aug, mask, T, E,
-                use_int8, a_index, n_tail=1):
+                use_int8, a_index, n_tail=1, stats_out=None):
         # qh/kh/vh: (B,H,L,D) fp16;  alpha_logit: (H,Mb) fp32 logits
         # lut: (B,H,Mb,T) video tiles; lut_aug: (B,H,Mb,T+1) with prefix
         # mask: (B,H,Mb,Nb) int8; a_index: (L,) int64 row->block map
+        # stats_out: optional (H,) fp32, filled with per-head max lse
+        # (log2 domain) for QK-Clip monitoring; not part of autograd.
         B, H, L, D = qh.shape
         M_BLOCKS = triton.cdiv(L, E)
         scale = D ** -0.5
@@ -710,6 +720,11 @@ class _CubeQATFunction(torch.autograd.Function):
             scale, T + n_tail, L, M_BLOCKS, D, E, E, use_int8, True,
             num_warps=4, num_stages=3,
         )
+        if stats_out is not None:
+            # per-head max over batch and rows of the sparse-branch lse:
+            # (B,H,L) -> (H,). lse >= max logit (log2, scale-folded), so
+            # this upper-bounds MaxLogit within log2(L) bits.
+            stats_out.copy_(lse.amax(dim=(0, 2)))
         kphi = torch.softmax(kh.float(), -1).to(qh.dtype).contiguous()
 
         htot, ztot = _precompute_global(qphi, kphi, vh)     # (B,H,D,D),(B,H,D)
@@ -814,7 +829,7 @@ class _CubeQATFunction(torch.autograd.Function):
         # ~1/eps_l magnitudes that clip_grad_norm will bound after.
         dv = (dv_s.float() + dv_l).clamp_(-60000.0, 60000.0).to(vh.dtype)
         return (dq, dk, dv, d_alpha, None, None, None, None, None, None,
-                None, None)
+                None, None, None)
 
 
 # ---------------------------------------------------------------------------

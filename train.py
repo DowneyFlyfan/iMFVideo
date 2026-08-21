@@ -298,6 +298,58 @@ def ema_update(ema, model, decay):
 
 
 @torch.no_grad()
+def qk_clip(net, tau, world):
+    """QK-Clip (kexue.fm/archives/11126, Kimi K2 MuonClip): after the
+    optimizer step, rescale attention weights of any head whose MaxLogit
+    exceeded tau, by exactly the overshoot ratio.
+
+    In this MLA the q/k nope bands are per-head RMS-normed (scale-invariant
+    to their projections), so the only unbounded bilinear pair is
+    q_rope (per-head rows of q_b_proj) x k_rope (shared, from kv_a_proj).
+    Per Su's (qr, kr) rule the shared kr is never touched and qr takes the
+    full factor: W_qr^h *= tau / S_max^h.
+
+    Args:
+        net: IMFDiTVideo; blocks hold MLAAttention whose attn_impl exposes
+            logit_max_log2: (H,) fp32 per-head max lse of the last training
+            forward, log2 domain with the 1/sqrt(dn+dr) scale folded in.
+        tau: MaxLogit threshold in nats (Kimi K2 uses 100).
+        world: ranks; per-rank batches differ, so S_max is all-reduced with
+            MAX to keep the clip factors (and thus weights) identical.
+
+    Returns:
+        (num_clipped_heads, global_max_logit_nats) for logging.
+    """
+    from models.imf_dit_video import MLAAttention
+
+    ln2 = math.log(2.0)
+    n_clipped, s_global = 0, 0.0
+    for m in net.modules():
+        if not isinstance(m, MLAAttention):
+            continue
+        impl = m.attn_impl
+        stats = getattr(impl, "logit_max_log2", None)
+        if stats is None:
+            continue
+        if world > 1:
+            dist.all_reduce(stats, op=dist.ReduceOp.MAX)
+        s_nat = stats * ln2                       # (H,) MaxLogit in nats
+        s_global = max(s_global, s_nat.max().item())
+        gamma = (tau / s_nat).clamp(max=1.0)      # (H,) clip factors <= 1
+        hot = gamma < 1.0                         # (H,) bool
+        if not bool(hot.any()):
+            continue
+        n_clipped += int(hot.sum())
+        dn, dr = m.qk_nope_head_dim, m.qk_rope_head_dim
+        # q_b_proj.weight: (H*(dn+dr), dq); head h rope rows are
+        # [h*(dn+dr)+dn, (h+1)*(dn+dr)).
+        w = m.q_b_proj.weight                     # (H*(dn+dr), dq)
+        wv = w.view(m.num_heads, dn + dr, -1)     # (H, dn+dr, dq)
+        wv[:, dn:, :] *= gamma.to(w.dtype).view(-1, 1, 1)
+    return n_clipped, s_global
+
+
+@torch.no_grad()
 def all_reduce_grads(params, world):
     """Average gradients across ranks with a single flat all-reduce.
 
@@ -510,9 +562,14 @@ def main():
         # at step 3950 with no checkpoint, records/wan22_full_train.md).
         if torch.isfinite(grad_norm):
             optimizer.step()
+            # QK-Clip: bound per-head MaxLogit right after the update so the
+            # bilinear rope logits cannot enter the fp16/quantization NaN
+            # regime that stalled runs 1 and 3 at step ~3500-3950.
+            n_hot, s_max = qk_clip(net, o.qk_clip_tau, world)
             if ema is not None:
                 ema_update(ema, net, config.run.ema_decay)
         else:
+            n_hot, s_max = 0, float("nan")
             optimizer.zero_grad(set_to_none=True)
             if rank == 0:
                 print(f"step {step + 1}: non-finite grad_norm, step skipped")
@@ -539,6 +596,7 @@ def main():
                 f"loss_u={lu:.4f} loss_u_ema={loss_u_ema:.4f} "
                 f"loss_v={dict_losses['loss_v'].item():.4f} "
                 f"grad_norm={grad_norm.item():.3f} lr={lr:.2e} "
+                f"qkclip={n_hot}/{s_max:.0f} "
                 f"{imgs_s:.1f} samples/s",
                 flush=True,
             )

@@ -39,6 +39,10 @@ class ModelConfig:
     sla2_bq: int = 128  # query block length
     sla2_bk: int = 64  # key block length
     sla2_alpha_init: float = 0.9  # initial sparse/linear mixing ratio in (0,1)
+    # 3D tile (t, h, w) for cube attention; prod = tile tokens E. Must
+    # divide the patch grid. (4,4,4)=64 for Wan2.1 448x832; (1,2,8)=16
+    # for Wan2.2 704x1280 (grid (31,22,40): 31 is prime).
+    sla2_tile: tuple = (4, 4, 4)
 
     # --- Feed-forward and normalization ---
     # NOTE: Fix these parameters
@@ -156,6 +160,12 @@ class OptimConfig:
     muon_coeff_lr: float = 2e-2  # Adam learning rate for that fit
     muon_coeff_seed: int = 0  # RNG seed, so the coefficients are reproducible
     grad_clip: float = 1.0
+    # QK-Clip (kexue.fm/archives/11126, Kimi K2 MuonClip): after each
+    # optimizer step, any attention head whose MaxLogit exceeded this
+    # threshold (nats) has its un-normed rope query rows rescaled by
+    # tau / S_max. Cures the MaxLogit explosion that produced backward NaN
+    # at step ~3500-3950 in Wan2.2 runs 1 and 3.
+    qk_clip_tau: float = 100.0
 
     lr_schedule: str = "wsd"
 
