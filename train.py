@@ -570,9 +570,23 @@ def main():
                 ema_update(ema, net, config.run.ema_decay)
         else:
             n_hot, s_max = 0, float("nan")
-            optimizer.zero_grad(set_to_none=True)
             if rank == 0:
-                print(f"step {step + 1}: non-finite grad_norm, step skipped")
+                # name the culprits: first parameters (by module order) whose
+                # grad went non-finite, with counts -- pinpoints which layer
+                # and which sub-path (q/k, v, phi, mlp) sources the NaN.
+                bad = []
+                for nm, p in net.named_parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        bad.append((nm, int((~torch.isfinite(p.grad)).sum())))
+                    if len(bad) >= 6:
+                        break
+                lv = dict_losses["loss_v"].item()
+                print(
+                    f"step {step + 1}: non-finite grad_norm, step skipped; "
+                    f"loss_u={dict_losses['loss_u'].item():.4g} "
+                    f"loss_v={lv:.4g} bad={bad}"
+                )
+            optimizer.zero_grad(set_to_none=True)
         step += 1
 
         if rank == 0 and step % config.run.log_every == 0:
