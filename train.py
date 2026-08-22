@@ -540,6 +540,19 @@ def main():
             labels = labels.to(device, non_blocking=True)
 
             loss, dict_losses = loss_mod(latents, labels)
+            if not torch.isfinite(loss):
+                # Forward-NaN forensics: dump the offending batch once per
+                # rank so the failure reproduces offline (the NaN is batch-
+                # dependent -- healthy steps interleave with nan ones).
+                # latents: (B, C, T, H, W) fp32; labels: (B,) int64.
+                _p = os.path.join(
+                    config.run.out_dir, f"nan_batch_r{rank}.pt")
+                if not os.path.exists(_p):
+                    torch.save(
+                        {"latents": latents.cpu(), "labels": labels.cpu(),
+                         "step": step}, _p)
+                    print(f"rank {rank}: dumped non-finite-loss batch to {_p}",
+                          flush=True)
             # Divide so the accumulated gradient is the mean over micro-batches.
             (loss / o.grad_accum).backward()
             loss_sum += loss.item() / o.grad_accum
