@@ -164,8 +164,12 @@ class OptimConfig:
     # optimizer step, any attention head whose MaxLogit exceeded this
     # threshold (nats) has its un-normed rope query rows rescaled by
     # tau / S_max. Cures the MaxLogit explosion that produced backward NaN
-    # at step ~3500-3950 in Wan2.2 runs 1 and 3.
-    qk_clip_tau: float = 100.0
+    # at step ~3500-3950 in Wan2.2 runs 1 and 3. Kimi uses 100 for fp32/bf16
+    # kernels; the INT8-QAT backward here starts emitting NaN near logit
+    # ~60-66 (run 4 skips began at step 3912 with S_max 66 and tau 100
+    # never engaging), so the threshold sits at 40 -- inside the op's
+    # proven-stable region (<= 50) and per Su even tau 30 is lossless.
+    qk_clip_tau: float = 40.0
 
     lr_schedule: str = "wsd"
 
