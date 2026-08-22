@@ -17,6 +17,7 @@ Launch (1 process):  python train.py
 """
 
 import dataclasses
+import gc
 import math
 import os
 import time
@@ -496,14 +497,26 @@ def main():
 
     start_step = 0
     if config.run.resume:
-        # weights_only=True is the PyTorch >= 2.6 default and is kept: every
-        # value we save is a tensor, number, string, tuple or dict.
-        ckpt = torch.load(config.run.resume, map_location="cpu", weights_only=True)
-        net.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        if ema is not None and "ema" in ckpt:
-            ema.load_state_dict(ckpt["ema"])
-        start_step = ckpt["step"]
+        # Rank-serialized load: 4 ranks decompressing the 3.5 GB checkpoint
+        # simultaneously peak past the pod's 64 GiB cgroup limit and the
+        # whole job gets a silent SIGKILL (observed on Nautilus). One rank
+        # loads at a time; the others wait at the barrier.
+        for r in range(world):
+            if rank == r:
+                # weights_only=True is the PyTorch >= 2.6 default and is
+                # kept: every value we save is a tensor, number, string,
+                # tuple or dict.
+                ckpt = torch.load(
+                    config.run.resume, map_location="cpu", weights_only=True)
+                net.load_state_dict(ckpt["model"])
+                optimizer.load_state_dict(ckpt["optimizer"])
+                if ema is not None and "ema" in ckpt:
+                    ema.load_state_dict(ckpt["ema"])
+                start_step = ckpt["step"]
+                del ckpt
+                gc.collect()
+            if world > 1:
+                dist.barrier()
         if rank == 0:
             print(f"resumed from {config.run.resume} at step {start_step}", flush=True)
 
