@@ -390,6 +390,20 @@ class SLA2CubeQATAttentionImpl(nn.Module):
             if not hasattr(self, "logit_max_log2"):
                 self.logit_max_log2 = torch.zeros(
                     qh.shape[1], device=qh.device, dtype=torch.float32)
+            # phi-Clip signals (Su's "clip wherever it is unstable",
+            # kexue.fm/archives/11126): the linear branch's feature map
+            # phi = softmax over D of q/k is itself a softmax whose MaxLogit
+            # is the per-token feature range; when it explodes phi saturates
+            # one-hot, den = phi(q) . z bottoms at eps_l and 1/eps grads
+            # follow. phi_range_q/k: (H,) fp32, per-head max over (B, L) of
+            # max_d - mean_d of the raw head features.
+            with torch.no_grad():
+                qf = qh.float()
+                kf = kh.float()
+                self.phi_range_q = (
+                    qf.amax(-1) - qf.mean(-1)).amax(dim=(0, 2))
+                self.phi_range_k = (
+                    kf.amax(-1) - kf.mean(-1)).amax(dim=(0, 2))
             o = _CubeQATFunction.apply(qh, kh, vh, self.alpha_logit, lut,
                                        lut_aug, mask, T, self.E,
                                        self.use_int8, self.a_index,

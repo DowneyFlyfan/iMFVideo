@@ -170,6 +170,16 @@ class OptimConfig:
     # never engaging), so the threshold sits at 40 -- inside the op's
     # proven-stable region (<= 50) and per Su even tau 30 is lossless.
     qk_clip_tau: float = 40.0
+    # phi-Clip, Su's "clip wherever unstable" applied to the SLA2 linear
+    # branch: phi = softmax over the D = 64 channels of each head's q/k
+    # features, so its MaxLogit is the feature range max_d - mean_d. Past
+    # ~ln D the softmax saturates one-hot, the linear denominator
+    # phi(q) . z bottoms at eps_l = 1e-5 and 1/eps gradients follow. 10
+    # keeps every channel's mass above e^-10 so z = sum phi(k) stays
+    # bounded away from zero over the 27k-token sequence. Random init
+    # already measures range ~8, and an empty channel over L = 27k tokens
+    # needs range >> ln(L * D) ~ 14, so 12 clips only the danger zone.
+    phi_clip_tau: float = 12.0
 
     lr_schedule: str = "wsd"
 

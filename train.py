@@ -351,6 +351,60 @@ def qk_clip(net, tau, world):
 
 
 @torch.no_grad()
+def phi_clip(net, tau, world):
+    """phi-Clip: Su's QK-Clip principle applied to the linear branch's
+    feature softmax (kexue.fm/archives/11126, "clip wherever unstable").
+
+    phi = softmax over D of the head features, so its MaxLogit is the
+    feature range max_d - mean_d. When it exceeds tau, phi saturates
+    one-hot, the linear denominator phi(q) . z bottoms at eps_l and 1/eps
+    gradients follow (the forward-NaN stall of runs 3-5). The un-normed
+    producers are the rope bands: per-head q_b_proj rope rows take
+    tau / R_q^h; the head-shared kv_a_proj rope rows take the global
+    tau / max_h R_k (a shared weight cannot be clipped per head).
+
+    Args:
+        net: IMFDiTVideo; attn impls expose phi_range_q/k: (H,) fp32
+            per-head feature ranges of the last training forward.
+        tau: range threshold in feature units (softmax over D = 64
+            saturates hard past ~ln-scale ranges; 10 keeps every channel
+            mass above e^-10 so z stays bounded away from 0).
+        world: ranks for the MAX all-reduce (identical clips everywhere).
+
+    Returns:
+        (num_clipped_heads, global_max_range) for logging.
+    """
+    from models.imf_dit_video import MLAAttention
+
+    n_clipped, r_global = 0, 0.0
+    for m in net.modules():
+        if not isinstance(m, MLAAttention):
+            continue
+        impl = m.attn_impl
+        rq = getattr(impl, "phi_range_q", None)
+        rk = getattr(impl, "phi_range_k", None)
+        if rq is None or rk is None:
+            continue
+        if world > 1:
+            dist.all_reduce(rq, op=dist.ReduceOp.MAX)
+            dist.all_reduce(rk, op=dist.ReduceOp.MAX)
+        r_global = max(r_global, rq.max().item(), rk.max().item())
+        dn, dr = m.qk_nope_head_dim, m.qk_rope_head_dim
+        gq = (tau / rq).clamp(max=1.0)            # (H,) per-head factors
+        if bool((gq < 1.0).any()):
+            n_clipped += int((gq < 1.0).sum())
+            w = m.q_b_proj.weight                 # (H*(dn+dr), dq)
+            wv = w.view(m.num_heads, dn + dr, -1)
+            wv[:, dn:, :] *= gq.to(w.dtype).view(-1, 1, 1)
+        gk = min(1.0, tau / rk.max().item())      # scalar, shared k_rope
+        if gk < 1.0:
+            n_clipped += 1
+            # kv_a_proj.weight: (dc+dr, d); shared rope rows are the last dr.
+            m.kv_a_proj.weight[-dr:, :] *= gk
+    return n_clipped, r_global
+
+
+@torch.no_grad()
 def all_reduce_grads(params, world):
     """Average gradients across ranks with a single flat all-reduce.
 
@@ -592,10 +646,12 @@ def main():
             # bilinear rope logits cannot enter the fp16/quantization NaN
             # regime that stalled runs 1 and 3 at step ~3500-3950.
             n_hot, s_max = qk_clip(net, o.qk_clip_tau, world)
+            n_phi, r_max = phi_clip(net, o.phi_clip_tau, world)
             if ema is not None:
                 ema_update(ema, net, config.run.ema_decay)
         else:
             n_hot, s_max = 0, float("nan")
+            n_phi, r_max = 0, float("nan")
             if rank == 0:
                 # name the culprits: first parameters (by module order) whose
                 # grad went non-finite, with counts -- pinpoints which layer
@@ -636,7 +692,7 @@ def main():
                 f"loss_u={lu:.4f} loss_u_ema={loss_u_ema:.4f} "
                 f"loss_v={dict_losses['loss_v'].item():.4f} "
                 f"grad_norm={grad_norm.item():.3f} lr={lr:.2e} "
-                f"qkclip={n_hot}/{s_max:.0f} "
+                f"qkclip={n_hot}/{s_max:.0f} phiclip={n_phi}/{r_max:.1f} "
                 f"{imgs_s:.1f} samples/s",
                 flush=True,
             )
