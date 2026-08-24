@@ -29,7 +29,7 @@ class ModelConfig:
     in_channels: int = 16  # Wan2.1 VAE latent channels
     num_classes: int = 1000
     attn_impl: str = (
-        "flash_jvp"  # "flash_jvp" | "sla2_jvp" | "sla2_cube_qat" | "sdpa_flash" | "sdpa"
+        "sla2_cube_qat"  # "flash_jvp" | "sla2_jvp" | "sla2_cube_qat" | "sdpa_flash" | "sdpa"
     )
     mla_use_output_gate: bool = True
 
@@ -154,7 +154,7 @@ class OptimConfig:
     muon_nesterov: bool = True  # step along G + mu * M instead of M
     muon_ns_steps: int = 5  # Newton-Schulz iterations per step
     muon_lr_scale_constant: float = 0.2
-    muon_coeff_mode: str = "per_shape"
+    muon_coeff_mode: str = "jordan"
     muon_coeff_samples: int = 32  # random matrices SVD'd to estimate the spectrum
     muon_coeff_iters: int = 3000  # Adam iterations for the (kappa, x1, x2) fit
     muon_coeff_lr: float = 2e-2  # Adam learning rate for that fit
@@ -170,16 +170,11 @@ class OptimConfig:
     # never engaging), so the threshold sits at 40 -- inside the op's
     # proven-stable region (<= 50) and per Su even tau 30 is lossless.
     qk_clip_tau: float = 40.0
-    # phi-Clip, Su's "clip wherever unstable" applied to the SLA2 linear
-    # branch: phi = softmax over the D = 64 channels of each head's q/k
-    # features, so its MaxLogit is the feature range max_d - mean_d. Past
-    # ~ln D the softmax saturates one-hot, the linear denominator
-    # phi(q) . z bottoms at eps_l = 1e-5 and 1/eps gradients follow. 10
-    # keeps every channel's mass above e^-10 so z = sum phi(k) stays
-    # bounded away from zero over the 27k-token sequence. Random init
-    # already measures range ~8, and an empty channel over L = 27k tokens
-    # needs range >> ln(L * D) ~ 14, so 12 clips only the danger zone.
-    phi_clip_tau: float = 12.0
+    # Linear-QK-Clip: lower bound for the complement linear-attention
+    # denominator.  After every optimizer step the complete q/k feature
+    # producers are rescaled so the channel-softmax denominator is at least
+    # this value. This bounds the T2 quotient-JVP term directly.
+    phi_clip_den_floor: float = 1e-1
 
     lr_schedule: str = "wsd"
 

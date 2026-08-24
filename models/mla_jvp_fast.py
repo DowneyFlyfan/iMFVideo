@@ -50,6 +50,15 @@ __all__ = ["build_fast_jvp_state", "model_du_dt_fast"]
 _FP16 = torch.float16
 
 
+def cube_attention_jvp_buffers(batch_size, sequence_length, attention_width, device):
+    """Allocate cube-attention primal/tangent buffers without fp16 T2 loss."""
+    primal = torch.empty(batch_size, sequence_length, attention_width,
+                          device=device, dtype=_FP16)
+    tangent = torch.empty(batch_size, sequence_length, attention_width,
+                          device=device, dtype=torch.float32)
+    return primal, tangent
+
+
 def _attn_sublayer_jvp(h, dh, p, w16, cos, sin, eps):
     """MLA attention sublayer JVP: a = out_proj(gate(attn(norm1(h)))) * g_attn.
 
@@ -107,8 +116,8 @@ def _attn_sublayer_jvp(h, dh, p, w16, cos, sin, eps):
         CLAMP=False, num_warps=4,
     )
 
-    attn = torch.empty(2 * B, S, H * dv, device=dev, dtype=_FP16)
     if "cube" in p:
+        attn, dattn = cube_attention_jvp_buffers(B, S, H * dv, dev)
         # SLA2-Cube-QAT JVP (models/sla2_cube_qat.py): int8 primal scores
         # over routed 3D tiles + prefix tail, linear complement, alpha mix.
         cb = p["cube"]
@@ -143,21 +152,21 @@ def _attn_sublayer_jvp(h, dh, p, w16, cos, sin, eps):
                 qb, kb, vb, dqb, dkb, dvb, cb["alpha"], cb["topk"],
                 cb["Np"], cb["E"], cb["P"],
                 proj_q=cb["proj_q"], proj_k=cb["proj_k"])
-            #   o_a, do_a: (g, H, L, dv) fp32, tile-major token order
-            # into the (B, S, H*dv) fp16 buffer (stay tile-major under
-            # residency; otherwise scatter back to model order)
+            # o_a is fp16-safe. do_a contains linear quotient T2 and must
+            # remain fp32 through the output projection.
             if pre_perm:
                 attn[bi:bi + g] = o_a.permute(0, 2, 1, 3).reshape(
                     g, S, H * dv)
-                attn[B + bi:B + bi + g] = do_a.permute(
+                dattn[bi:bi + g] = do_a.permute(
                     0, 2, 1, 3).reshape(g, S, H * dv)
             else:
                 attn[bi:bi + g] = o_a[:, :, inv].permute(
                     0, 2, 1, 3).reshape(g, S, H * dv)
-                attn[B + bi:B + bi + g] = do_a[:, :, inv].permute(
+                dattn[bi:bi + g] = do_a[:, :, inv].permute(
                     0, 2, 1, 3).reshape(g, S, H * dv)
             del qb, kb, vb, dqb, dkb, dvb, o_a, do_a
     elif "sla2" in p:
+        attn = torch.empty(2 * B, S, H * dv, device=dev, dtype=_FP16)
         # SLA2 sparse-linear attention JVP (models/sla2_mla_jvp.py):
         # sparse branch over routed blocks + complement linear states.
         sl = p["sla2"]  # dict: alpha (H,Mb) fp32, proj_q/proj_k (hd,hd), knobs
@@ -174,6 +183,7 @@ def _attn_sublayer_jvp(h, dh, p, w16, cos, sin, eps):
         attn[:B] = o_a.permute(0, 2, 1, 3).reshape(B, S, H * dv).to(_FP16)
         attn[B:] = do_a.permute(0, 2, 1, 3).reshape(B, S, H * dv).to(_FP16)
     else:
+        attn = torch.empty(2 * B, S, H * dv, device=dev, dtype=_FP16)
         # o[m, h, :] = softmax_s(q . k * scale) @ v  (fused dense flash JVP)
         _flash_jvp(qv[:B], kv_[:B], vv[:B], qv[B:], kv_[B:], vv[B:],
                    attn[:B].view(B, S, H, dv), attn[B:].view(B, S, H, dv),
@@ -183,12 +193,26 @@ def _attn_sublayer_jvp(h, dh, p, w16, cos, sin, eps):
     if "w_og" in w16:
         z = _mm16(xs.view(M, D), w16["w_og"])        # (M, H*dv) fp16
         tot = half * H * dv
-        _out_gate_jvp_kernel[(triton.cdiv(tot, 1024),)](
-            attn[:B], attn[B:], z, z[half:], tot,
-            BLOCK=1024, CLAMP=False, num_warps=4,
-        )
+        if "cube" in p:
+            _out_gate_jvp_kernel[(triton.cdiv(tot, 1024),)](
+                attn, dattn, z, z[half:], tot,
+                BLOCK=1024, CLAMP=False, num_warps=4,
+            )
+        else:
+            _out_gate_jvp_kernel[(triton.cdiv(tot, 1024),)](
+                attn[:B], attn[B:], z, z[half:], tot,
+                BLOCK=1024, CLAMP=False, num_warps=4,
+            )
 
     # proj[m, j] = sum_k attn[m, k] * w_out[j, k]    (einsum "mk,jk->mj")
+    if "cube" in p:
+        proj = _mm16(attn.view(half, H * dv), w16["w_out"],
+                     out_dtype=torch.float32).view(B, S, D)
+        dproj = torch.matmul(
+            dattn.view(half, H * dv), p["w_out"].float().t()
+        ).view(B, S, D)
+        g = p["g_attn"]                              # (d,) fp32 vector gate
+        return proj * g, dproj * g
     proj = _mm16(attn.view(M, H * dv), w16["w_out"],
                  out_dtype=torch.float32).view(2 * B, S, D)
     g = p["g_attn"]                                  # (d,) fp32 vector gate
