@@ -35,7 +35,6 @@ import triton.language as tl
 
 from models.mla_video_sparse_jvp import (
     _linear_jvp,
-    _phi_jvp,
     _plenty_of_vram,
     route_tiles,
     route_tiles_fast,
@@ -50,6 +49,24 @@ from models.sla2_vendor.kernel_sparse_qat import (
 __all__ = ["SLA2CubeQATAttentionImpl", "sla2_cube_qat_jvp"]
 
 _EPS_L = 1e-5  # linear-branch normalizer epsilon (matches SLA2)
+
+
+def _linear_feature_map_jvp(x, dx, epsilon):
+    """Bounded channel-softmax feature map and its Jacobian-vector product.
+
+    Shapes: `x` and optional `dx` are `(B, H, L, D)`; returned primal and
+    tangent are float32 except that float64 inputs remain float64 for the
+    analytic regression test.  `epsilon / D` is the per-channel floor.
+    """
+    work_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+    raw = torch.softmax(x.to(work_dtype), dim=-1)
+    epsilon = float(epsilon)
+    phi = raw.mul(1.0 - epsilon).add(epsilon / x.shape[-1])
+    if dx is None:
+        return phi, None
+    dxf = dx.to(work_dtype)
+    draw = raw * (dxf - (raw * dxf).sum(-1, keepdim=True))
+    return phi, draw.mul(1.0 - epsilon)
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +226,7 @@ def _sparse_primal_only(q, k, v, lut, T, Np, E, prefix_len):
 
 def sla2_cube_qat_jvp(q, k, v, dq, dk, dv, alpha, topk_frac, Np, E,
                       prefix_len, proj_q=None, proj_k=None,
-                      lut=None, T=None):
+                      lut=None, T=None, phi_epsilon=0.0):
     """Cube-block QAT attention (primal, tangent): int8 primal scores.
 
     Inputs in TILE-MAJOR order; see module docstring for the composition.
@@ -262,8 +279,8 @@ def sla2_cube_qat_jvp(q, k, v, dq, dk, dv, alpha, topk_frac, Np, E,
     # path: chunked per head, which keeps a 16 GB card alive beside the
     # training footprint.
     if _plenty_of_vram(q.device):
-        qphi, dqphi = _phi_jvp(q, dq)                        # (B,H,L,D)
-        kphi, dkphi = _phi_jvp(k, dk)
+        qphi, dqphi = _linear_feature_map_jvp(q, dq, phi_epsilon)
+        kphi, dkphi = _linear_feature_map_jvp(k, dk, phi_epsilon)
         o_l, do_l = _linear_jvp(qphi, dqphi, kphi, dkphi, v, dv,
                                 lut, Np, E)                  # (B,H,L,D)
         del qphi, dqphi, kphi, dkphi
@@ -272,8 +289,10 @@ def sla2_cube_qat_jvp(q, k, v, dq, dk, dv, alpha, topk_frac, Np, E,
         do_l = torch.empty_like(do)
         for h0 in range(H):
             sl = slice(h0, h0 + 1)
-            qphi, dqphi = _phi_jvp(q[:, sl], dq[:, sl])
-            kphi, dkphi = _phi_jvp(k[:, sl], dk[:, sl])
+            qphi, dqphi = _linear_feature_map_jvp(
+                q[:, sl], dq[:, sl], phi_epsilon)
+            kphi, dkphi = _linear_feature_map_jvp(
+                k[:, sl], dk[:, sl], phi_epsilon)
             ol_h, dol_h = _linear_jvp(qphi, dqphi, kphi, dkphi,
                                       v[:, sl], dv[:, sl], lut[:, sl],
                                       Np, E)
@@ -310,7 +329,7 @@ class SLA2CubeQATAttentionImpl(nn.Module):
 
     def __init__(self, head_dim, seq_len, num_heads, grid, tile=(4, 4, 4),
                  topk=0.03, alpha_init=0.9, use_int8=True,
-                 pre_permuted=False):
+                 pre_permuted=False, linear_den_floor=0.0):
         # pre_permuted: the MODEL keeps the whole sequence in tile-major
         # token order (IMFDiTVideo.tile_major); skip per-call permutes.
         super().__init__()
@@ -318,10 +337,25 @@ class SLA2CubeQATAttentionImpl(nn.Module):
         self.E = tile[0] * tile[1] * tile[2]
         self.topk_frac = topk
         self.use_int8 = use_int8
+        self.linear_den_floor = float(linear_den_floor)
         n_patch = grid[0] * grid[1] * grid[2]
         self.prefix_len = seq_len - n_patch
         perm, inv, self.Np = tile_permutation(
             grid, tile, self.prefix_len, torch.device("cpu"))
+        self.T = max(1, min(self.Np, int(topk * self.Np)))
+        self.linear_complement_tokens = (self.Np - self.T) * self.E
+        if self.linear_den_floor < 0.0:
+            raise ValueError("linear_den_floor must be non-negative")
+        if self.linear_complement_tokens <= 0 and self.linear_den_floor:
+            raise ValueError("linear attention has no complement tokens")
+        self.linear_phi_epsilon = 0.0
+        if self.linear_den_floor:
+            self.linear_phi_epsilon = (
+                head_dim * self.linear_den_floor
+                / self.linear_complement_tokens
+            )
+            if not 0.0 < self.linear_phi_epsilon < 1.0:
+                raise ValueError("linear_den_floor is infeasible for this geometry")
         self.register_buffer("perm", perm, persistent=False)   # (L,)
         self.register_buffer("inv", inv, persistent=False)     # (L,)
         self.n_tail = -(-self.prefix_len // self.E)  # prefix tail blocks
@@ -401,11 +435,11 @@ class SLA2CubeQATAttentionImpl(nn.Module):
                     qf.amax(-1) - qf.amin(-1)).amax(dim=(0, 2))
                 self.phi_range_k = (
                     kf.amax(-1) - kf.amin(-1)).amax(dim=(0, 2))
-                self.linear_complement_tokens = (self.Np - T) * self.E
             o = _CubeQATFunction.apply(qh, kh, vh, self.alpha_logit, lut,
                                        lut_aug, mask, T, self.E,
                                        self.use_int8, self.a_index,
-                                       self.n_tail, self.logit_max_log2)
+                                       self.n_tail, self.linear_phi_epsilon,
+                                       self.logit_max_log2)
             if self.pre_permuted:
                 return o.permute(0, 2, 1, 3).to(q.dtype)
             return o[:, :, self.inv].permute(0, 2, 1, 3).to(q.dtype)
@@ -424,7 +458,12 @@ class SLA2CubeQATAttentionImpl(nn.Module):
                 D_ ** -0.5, T + self.n_tail, L_, M_BLOCKS, D_, self.E, self.E,
                 self.use_int8, True, num_warps=4, num_stages=3,
             )
-            kphi = torch.softmax(kh.float(), -1).to(qh.dtype).contiguous()
+            qphi, _ = _linear_feature_map_jvp(
+                qh, None, self.linear_phi_epsilon)
+            kphi, _ = _linear_feature_map_jvp(
+                kh, None, self.linear_phi_epsilon)
+            qphi = qphi.to(qh.dtype).contiguous()
+            kphi = kphi.to(qh.dtype).contiguous()
             htot, ztot = _precompute_global(qphi, kphi, vh)
             o_l = torch.empty_like(vh)                        # (B,H,L,D)
             den = torch.empty(B_, H_, L_, device=qh.device,
@@ -436,6 +475,7 @@ class SLA2CubeQATAttentionImpl(nn.Module):
                 False, False, T + self.n_tail <= 4,
                 num_warps=8, num_stages=3,
             )
+            self.linear_den_min = den.detach().amin()
 
         # token counts per query block: Np full video tiles, then the
         # prefix split into n_tail blocks (last one ragged)
@@ -476,7 +516,7 @@ def _cube_fused_jvp_kernel(
     s_zbb, s_zbh, s_zbn,       # strides of the (B, H, Np, D) sums
     s_gb, s_gh,                # strides of the (B, H, D, Dv) globals
     s_ab,                      # stride of the (H, Mb) alpha rows
-    H, L, T, NPE, scale, eps_l,
+    H, L, T, NPE, scale, eps_l, phi_epsilon,
     HEAD_DIM: tl.constexpr,    # D = Dv = 64
     BLOCK: tl.constexpr,       # E: query tile = key tile = quant block
     N_TAIL: tl.constexpr,      # ceil(P / E) always-attended prefix blocks
@@ -506,9 +546,11 @@ def _cube_fused_jvp_kernel(
     qmx = tl.max(qf32, 1)                                    # (BLOCK,)
     qex = tl.exp(qf32 - qmx[:, None])                        # (BLOCK, D)
     qden = tl.sum(qex, 1)                                    # (BLOCK,)
-    qphi = qex / qden[:, None]                               # (BLOCK, D)
-    qdot = tl.sum(qphi * dq32, 1)                            # (BLOCK,)
-    dqphi = qphi * (dq32 - qdot[:, None])                    # (BLOCK, D)
+    qraw = qex / qden[:, None]                               # (BLOCK, D)
+    qphi = (1.0 - phi_epsilon) * qraw + phi_epsilon / HEAD_DIM
+    qdot = tl.sum(qraw * dq32, 1)                            # (BLOCK,)
+    dqphi = (1.0 - phi_epsilon) * qraw * (
+        dq32 - qdot[:, None])                                # (BLOCK, D)
 
     # ---- sparse-branch flash-JVP recurrence over T routed + prefix ----
     m_i = tl.full([BLOCK], float("-inf"), tl.float32)
@@ -616,7 +658,7 @@ def _cube_fused_jvp_kernel(
 
 def sla2_cube_qat_jvp_fused(q, k, v, dq, dk, dv, alpha, topk_frac, Np, E,
                             prefix_len, proj_q=None, proj_k=None,
-                            lut=None, T=None):
+                            lut=None, T=None, phi_epsilon=0.0):
     """Fused cube-QAT JVP: one kernel for both branches + mix.
 
     Same math as sla2_cube_qat_jvp (int8 primal scores, fp16 tangent dots,
@@ -653,7 +695,7 @@ def sla2_cube_qat_jvp_fused(q, k, v, dq, dk, dv, alpha, topk_frac, Np, E,
         qc[1].stride(0), qc[1].stride(1), qc[1].stride(2),
         Hb.stride(0), Hb.stride(1), Hb.stride(2),
         zb.stride(0), zb.stride(1), zb.stride(2),
-        H, L, E=E, D=D, num_warps=4)
+        H, L, phi_epsilon, E=E, D=D, num_warps=4)
     H_all = Hb.sum(2).contiguous()                           # (B,H,D,D)
     dH_all = dHb.sum(2).contiguous()
     z_all = zb.sum(2).contiguous()                           # (B,H,D)
@@ -676,7 +718,7 @@ def sla2_cube_qat_jvp_fused(q, k, v, dq, dk, dv, alpha, topk_frac, Np, E,
         zb.stride(0), zb.stride(1), zb.stride(2),
         H_all.stride(0), H_all.stride(1),
         af.stride(0),
-        H, L, T, Np * E, scale, _EPS_L,
+        H, L, T, Np * E, scale, _EPS_L, phi_epsilon,
         HEAD_DIM=D, BLOCK=E,
         N_TAIL=-(-prefix_len // E),
         num_warps=8, num_stages=1,
@@ -714,7 +756,8 @@ class _CubeQATFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, qh, kh, vh, alpha_logit, lut, lut_aug, mask, T, E,
-                use_int8, a_index, n_tail=1, stats_out=None):
+                use_int8, a_index, n_tail=1, phi_epsilon=0.0,
+                stats_out=None):
         # qh/kh/vh: (B,H,L,D) fp16;  alpha_logit: (H,Mb) fp32 logits
         # lut: (B,H,Mb,T) video tiles; lut_aug: (B,H,Mb,T+1) with prefix
         # mask: (B,H,Mb,Nb) int8; a_index: (L,) int64 row->block map
@@ -737,7 +780,13 @@ class _CubeQATFunction(torch.autograd.Function):
             # (B,H,L) -> (H,). lse >= max logit (log2, scale-folded), so
             # this upper-bounds MaxLogit within log2(L) bits.
             stats_out.copy_(lse.amax(dim=(0, 2)))
-        kphi = torch.softmax(kh.float(), -1).to(qh.dtype).contiguous()
+        # The sparse kernel also materializes an ordinary q softmax as a
+        # convenience.  Replace it here with the bounded linear map so the
+        # linear primal, its backward, and the JVP share one invariant.
+        qphi, _ = _linear_feature_map_jvp(qh, None, phi_epsilon)
+        kphi, _ = _linear_feature_map_jvp(kh, None, phi_epsilon)
+        qphi = qphi.to(qh.dtype).contiguous()
+        kphi = kphi.to(qh.dtype).contiguous()
 
         htot, ztot = _precompute_global(qphi, kphi, vh)     # (B,H,D,D),(B,H,D)
         o_l = torch.empty_like(vh)                          # (B,H,L,D)
@@ -760,6 +809,7 @@ class _CubeQATFunction(torch.autograd.Function):
                               a_index)
         ctx.T, ctx.E, ctx.scale = T, E, scale
         ctx.n_tail = n_tail
+        ctx.phi_epsilon = phi_epsilon
         return o
 
     @staticmethod
@@ -767,7 +817,7 @@ class _CubeQATFunction(torch.autograd.Function):
         (qh, kh, vh, alpha_logit, lut, lut_aug, mask, lse, o_s, o_l, den,
          qphi, kphi, htot, ztot, a_index) = ctx.saved_tensors
         T, E, scale = ctx.T, ctx.E, ctx.scale
-        n_tail = ctx.n_tail
+        n_tail, phi_epsilon = ctx.n_tail, ctx.phi_epsilon
         B, H, L, D = qh.shape
         M_BLOCKS = triton.cdiv(L, E)
         N_BLOCKS = triton.cdiv(L, E)
@@ -831,17 +881,17 @@ class _CubeQATFunction(torch.autograd.Function):
         _phi_chain_add_kernel[(Mrows, B * H)](
             qphi, dqphi, dq_s, dq,
             qphi.stride(0), qphi.stride(1), qphi.stride(2),
-            H, L, E=E, D=D, num_warps=4)
+            H, L, phi_epsilon, E=E, D=D, num_warps=4)
         _phi_chain_add_kernel[(Mrows, B * H)](
             kphi, dkphi, dk_s, dk,
             kphi.stride(0), kphi.stride(1), kphi.stride(2),
-            H, L, E=E, D=D, num_warps=4)
+            H, L, phi_epsilon, E=E, D=D, num_warps=4)
         # dv_l is fp32 (see buffer note above); saturate the sum before the
         # fp16 grad cast autograd requires — one-hot-phi rows can carry
         # ~1/eps_l magnitudes that clip_grad_norm will bound after.
         dv = (dv_s.float() + dv_l).clamp_(-60000.0, 60000.0).to(vh.dtype)
         return (dq, dk, dv, d_alpha, None, None, None, None, None, None,
-                None, None, None)
+                None, None, None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -888,7 +938,7 @@ def _bwd_split_kernel(
 def _phi_chain_add_kernel(
     PHI, DPHI, DXS, DX,
     s_b, s_h, s_s,             # strides of the (B, H, L, D) tensors
-    H, L,
+    H, L, phi_epsilon,
     E: tl.constexpr,
     D: tl.constexpr,
 ):
@@ -907,8 +957,10 @@ def _phi_chain_add_kernel(
     phi = tl.load(PHI + ptr, mask=mask[:, None], other=0.0).to(tl.float32)
     dphi = tl.load(DPHI + ptr, mask=mask[:, None], other=0.0).to(tl.float32)
     dxs = tl.load(DXS + ptr, mask=mask[:, None], other=0.0).to(tl.float32)
-    dot = tl.sum(phi * dphi, 1)                              # (E,)
-    dx = dxs + phi * (dphi - dot[:, None])
+    raw_phi = (phi - phi_epsilon / D) / (1.0 - phi_epsilon)
+    dot = tl.sum(raw_phi * dphi, 1)                          # (E,)
+    dx = dxs + (1.0 - phi_epsilon) * raw_phi * (
+        dphi - dot[:, None])
     # dphi can legitimately reach ~1/eps_l in the empty-phi-channel regime;
     # saturate so the fp16 store stays finite (grad clip then bounds the
     # step). Healthy dx is O(1).
@@ -928,7 +980,7 @@ def _phi_states_kernel(
     s_kb, s_kh, s_ks,          # strides of the (B, H, L, D) inputs
     s_hb, s_hh, s_hn,          # strides of the (B, H, Np, D, Dv) states
     s_zb, s_zh, s_zn,          # strides of the (B, H, Np, D) sums
-    H, L,
+    H, L, phi_epsilon,
     E: tl.constexpr,           # tile length
     D: tl.constexpr,           # head dim (= Dv)
 ):
@@ -950,9 +1002,11 @@ def _phi_states_kernel(
     mx = tl.max(k, 1)
     ex = tl.exp(k - mx[:, None])
     den = tl.sum(ex, 1)
-    kphi = ex / den[:, None]                    # (E, D)
-    dot = tl.sum(kphi * dk, 1)
-    dkphi = kphi * (dk - dot[:, None])          # (E, D)
+    kraw = ex / den[:, None]                    # (E, D)
+    kphi = (1.0 - phi_epsilon) * kraw + phi_epsilon / D
+    dot = tl.sum(kraw * dk, 1)
+    dkphi = (1.0 - phi_epsilon) * kraw * (
+        dk - dot[:, None])                      # (E, D)
 
     # tf32 dots: the states feed the linear-branch quotient, whose
     # overall tolerance is ~1e-3; ieee fp32 dots measured 3x slower here.

@@ -133,6 +133,7 @@ def build_model():
             tile=m.sla2_tile,
             topk=m.sla2_topk,
             alpha_init=m.sla2_alpha_init,
+            linear_den_floor=m.linear_den_floor,
         )
     elif m.attn_impl == "sla2_jvp":
         # SLA2 sparse-linear attention: a module factory, one stateful

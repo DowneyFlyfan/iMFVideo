@@ -151,7 +151,8 @@ def _attn_sublayer_jvp(h, dh, p, w16, cos, sin, eps):
             o_a, do_a = sla2_cube_qat_jvp(
                 qb, kb, vb, dqb, dkb, dvb, cb["alpha"], cb["topk"],
                 cb["Np"], cb["E"], cb["P"],
-                proj_q=cb["proj_q"], proj_k=cb["proj_k"])
+                proj_q=cb["proj_q"], proj_k=cb["proj_k"],
+                phi_epsilon=cb["phi_epsilon"])
             # o_a is fp16-safe. do_a contains linear quotient T2 and must
             # remain fp32 through the output projection.
             if pre_perm:
@@ -302,6 +303,7 @@ def build_fast_jvp_state(net):
                 "proj_k": impl.proj_k.detach(),                # (hd, hd)
                 "topk": impl.topk_frac, "Np": impl.Np, "E": impl.E,
                 "P": impl.prefix_len,
+                "phi_epsilon": impl.linear_phi_epsilon,
                 "perm": impl.perm, "inv": impl.inv,            # (L,) each
             }
         elif isinstance(impl, torch.nn.Module) and hasattr(impl, "sla2"):

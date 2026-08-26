@@ -43,6 +43,9 @@ class ModelConfig:
     # divide the patch grid. (4,4,4)=64 for Wan2.1 448x832; (1,2,8)=16
     # for Wan2.2 704x1280 (grid (31,22,40): 31 is prime).
     sla2_tile: tuple = (4, 4, 4)
+    # Smoothed linear-feature map lower bound for the complement denominator.
+    # This is evaluated before the JVP T2 quotient, unlike post-step clipping.
+    linear_den_floor: float = 1e-1
 
     # --- Feed-forward and normalization ---
     # NOTE: Fix these parameters
