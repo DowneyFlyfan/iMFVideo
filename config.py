@@ -175,6 +175,10 @@ class OptimConfig:
     # producers are rescaled so the channel-softmax denominator is at least
     # this value. This bounds the T2 quotient-JVP term directly.
     phi_clip_den_floor: float = 1e-1
+    # Resume preconditioner. A finite checkpoint can still contain Q/K
+    # ranges large enough to make the very first resumed linear-attention
+    # pass singular before post-step QK-Clip has a chance to run.
+    resume_linear_qk_scale: float = 1.0
 
     lr_schedule: str = "wsd"
 

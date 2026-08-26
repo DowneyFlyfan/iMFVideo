@@ -351,6 +351,26 @@ def qk_clip(net, tau, world):
 
 
 @torch.no_grad()
+def rescale_linear_qk_producers(net, scale):
+    """Scale complete linear Q/K producers before a resumed first forward."""
+    if not 0.0 < scale <= 1.0:
+        raise ValueError("resume_linear_qk_scale must lie in (0, 1]")
+    from models.imf_dit_video import MLAAttention
+
+    n_scaled = 0
+    for m in net.modules():
+        if not isinstance(m, MLAAttention):
+            continue
+        dn, dr = m.qk_nope_head_dim, m.qk_rope_head_dim
+        m.q_norm.weight.mul_(scale)
+        m.k_norm.weight.mul_(scale)
+        m.q_b_proj.weight.view(m.num_heads, dn + dr, -1)[:, dn:, :].mul_(scale)
+        m.kv_a_proj.weight[-dr:, :].mul_(scale)
+        n_scaled += 1
+    return n_scaled
+
+
+@torch.no_grad()
 def phi_clip(net, denominator_floor, world):
     """Bound the linear-attention tangent's quotient denominator.
 
@@ -566,6 +586,20 @@ def main():
                     config.run.resume, map_location="cpu", weights_only=True)
                 net.load_state_dict(ckpt["model"])
                 optimizer.load_state_dict(ckpt["optimizer"])
+                # Optimizer state restores param-group fields too; reset the
+                # configured Newton-Schulz coefficient mode after loading.
+                for group in optimizer.param_groups:
+                    if group.get("use_muon"):
+                        group["coeff_mode"] = o.muon_coeff_mode
+                if o.resume_linear_qk_scale < 1.0:
+                    n_scaled = rescale_linear_qk_producers(
+                        net, o.resume_linear_qk_scale
+                    )
+                    print(
+                        f"rank {rank}: resumed linear Q/K preconditioner "
+                        f"scale={o.resume_linear_qk_scale:.3f} modules={n_scaled}",
+                        flush=True,
+                    )
                 if ema is not None and "ema" in ckpt:
                     ema.load_state_dict(ckpt["ema"])
                 start_step = ckpt["step"]
