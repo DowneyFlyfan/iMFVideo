@@ -11,11 +11,11 @@
 - Normalization: the 48-channel mean and standard deviation from the server
   `wan22_full/stats.npz` were applied in reverse before VAE decoding.
 - Device: local NVIDIA GeForce RTX 5070 Ti with 16 GiB memory.
-- Sampling: seed 7000, class label 0, four MeanFlow steps, CFG scale 2.0.
+- Sampling: seed 7000, class label 0, one MeanFlow step, CFG scale 2.0.
 
 ## Result
 
-`step_0007000_sample.mp4` was generated successfully.
+`step_0007000_sample_1step.mp4` was generated successfully.
 
 - Codec: H.264.
 - Resolution: 1280 by 704 pixels.
@@ -33,3 +33,12 @@ The first decode failed because the sampler emitted float32 latents while the
 VAE weights were bfloat16. `generate_7k_video.py` now casts denormalized
 latents at the model-to-VAE boundary. The regression test passes, and the
 successful full generation verifies the correction end to end.
+
+The one-step default exactly matches the checkpoint's saved sampling setting.
+The earlier four-step comparison and this one-step output both decode as
+coloured texture rather than a coherent video. To isolate this result, a real
+normalised training latent from the shared dataset was denormalised with the
+same statistics and decoded through the same VAE; it produced a coherent
+reference scene. Therefore the local checkpoint/VAE loading and decode path
+are working, while the step-7,000 generator itself has not yet learned usable
+video samples.

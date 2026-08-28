@@ -41,7 +41,7 @@ def parse_args():
     parser.add_argument("--output", type=Path, default=Path("step_0007000_sample.mp4"))
     parser.add_argument("--seed", type=int, default=7000)
     parser.add_argument("--label", type=int, default=0)
-    parser.add_argument("--steps", type=int, default=4)
+    parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--fps", type=int, default=16)
     return parser.parse_args()
 

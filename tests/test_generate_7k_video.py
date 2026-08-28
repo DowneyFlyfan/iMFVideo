@@ -1,11 +1,12 @@
 """Regression test for checkpoint-driven local video inference."""
 
 import copy
+import sys
 
 import torch
 
 from config import config
-from generate_7k_video import apply_checkpoint_config, cast_for_vae
+from generate_7k_video import apply_checkpoint_config, cast_for_vae, parse_args
 
 
 def test_apply_checkpoint_config_uses_server_latent_geometry():
@@ -32,3 +33,9 @@ def test_cast_for_vae_matches_decoder_dtype():
     cast = cast_for_vae(latent, torch.bfloat16)
 
     assert cast.dtype is torch.bfloat16
+
+
+def test_default_sampler_uses_checkpoint_one_step_setting(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["generate_7k_video.py"])
+
+    assert parse_args().steps == 1
