@@ -352,22 +352,55 @@ def qk_clip(net, tau, world):
 
 
 @torch.no_grad()
-def rescale_linear_qk_producers(net, scale):
-    """Scale complete linear Q/K producers before a resumed first forward."""
+def rescale_linear_qk_producers(net, scale, optimizer=None):
+    """Scale linear Q/K producers and matching optimizer tensor state."""
     if not 0.0 < scale <= 1.0:
         raise ValueError("resume_linear_qk_scale must lie in (0, 1]")
     from models.imf_dit_video import MLAAttention
+
+    def scale_parameter(parameter, select):
+        select(parameter).mul_(scale)
+        if optimizer is None:
+            return
+        for state_value in optimizer.state.get(parameter, {}).values():
+            if (
+                torch.is_tensor(state_value)
+                and state_value.is_floating_point()
+                and state_value.shape == parameter.shape
+            ):
+                select(state_value).mul_(scale)
 
     n_scaled = 0
     for m in net.modules():
         if not isinstance(m, MLAAttention):
             continue
         dn, dr = m.qk_nope_head_dim, m.qk_rope_head_dim
-        m.q_norm.weight.mul_(scale)
-        m.k_norm.weight.mul_(scale)
-        m.q_b_proj.weight.view(m.num_heads, dn + dr, -1)[:, dn:, :].mul_(scale)
-        m.kv_a_proj.weight[-dr:, :].mul_(scale)
+        scale_parameter(m.q_norm.weight, lambda x: x)
+        scale_parameter(m.k_norm.weight, lambda x: x)
+        scale_parameter(
+            m.q_b_proj.weight,
+            lambda x: x.view(m.num_heads, dn + dr, -1)[:, dn:, :],
+        )
+        scale_parameter(m.kv_a_proj.weight, lambda x: x[-dr:, :])
         n_scaled += 1
+    return n_scaled
+
+
+def needs_linear_qk_preconditioner(checkpoint, scale):
+    """Apply a resume preconditioner only to a checkpoint not yet transformed."""
+    return scale < 1.0 and not checkpoint.get("linear_qk_preconditioned", False)
+
+
+@torch.no_grad()
+def rescale_resumed_linear_qk(net, ema, optimizer, scale):
+    """Precondition resume state and restart EMA in the new parameterisation."""
+    n_scaled = rescale_linear_qk_producers(net, scale, optimizer)
+    if ema is not None:
+        # A multiplicative Q/K preconditioner is a discontinuous change to the
+        # function represented by this nonlinear attention stack. Scaling an
+        # old EMA does not turn it into an average of the new trajectory, so
+        # begin a fresh EMA at the corrected online model.
+        ema.load_state_dict(net.state_dict())
     return n_scaled
 
 
@@ -573,6 +606,7 @@ def main():
     )
 
     start_step = 0
+    linear_qk_preconditioned = False
     if config.run.resume:
         # Rank-serialized load: 4 ranks decompressing the 3.5 GB checkpoint
         # simultaneously peak past the pod's 64 GiB cgroup limit and the
@@ -592,17 +626,24 @@ def main():
                 for group in optimizer.param_groups:
                     if group.get("use_muon"):
                         group["coeff_mode"] = o.muon_coeff_mode
-                if o.resume_linear_qk_scale < 1.0:
-                    n_scaled = rescale_linear_qk_producers(
-                        net, o.resume_linear_qk_scale
-                    )
-                    print(
-                        f"rank {rank}: resumed linear Q/K preconditioner "
-                        f"scale={o.resume_linear_qk_scale:.3f} modules={n_scaled}",
-                        flush=True,
-                    )
                 if ema is not None and "ema" in ckpt:
                     ema.load_state_dict(ckpt["ema"])
+                linear_qk_preconditioned = bool(
+                    ckpt.get("linear_qk_preconditioned", False)
+                )
+                if needs_linear_qk_preconditioner(
+                    ckpt, o.resume_linear_qk_scale
+                ):
+                    n_scaled = rescale_resumed_linear_qk(
+                        net, ema, optimizer, o.resume_linear_qk_scale
+                    )
+                    linear_qk_preconditioned = True
+                    print(
+                        f"rank {rank}: resumed linear Q/K preconditioner "
+                        f"scale={o.resume_linear_qk_scale:.3f} modules={n_scaled} "
+                        "(online, EMA, optimizer state)",
+                        flush=True,
+                    )
                 start_step = ckpt["step"]
                 del ckpt
                 gc.collect()
@@ -758,6 +799,7 @@ def main():
                     "optimizer": optimizer.state_dict(),
                     "ema": ema.state_dict() if ema is not None else None,
                     "step": step,
+                    "linear_qk_preconditioned": linear_qk_preconditioned,
                     "config": config_as_dict(),
                 },
                 path,

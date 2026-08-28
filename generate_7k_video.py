@@ -39,6 +39,10 @@ def parse_args():
     )
     parser.add_argument("--vae-cache", type=Path, default=Path(".cache/wan22_vae"))
     parser.add_argument("--output", type=Path, default=Path("step_0007000_sample.mp4"))
+    parser.add_argument(
+        "--weights", choices=("ema", "model"), default="ema",
+        help="checkpoint weights to sample; use model for legacy EMA-mismatched checkpoints",
+    )
     parser.add_argument("--seed", type=int, default=7000)
     parser.add_argument("--label", type=int, default=0)
     parser.add_argument("--steps", type=int, default=1)
@@ -68,7 +72,9 @@ def main():
 
     train.config = runtime_config
     net, parameter_count, _ = train.build_model()
-    weights = checkpoint.get("ema") or checkpoint["model"]
+    weights = checkpoint["model"] if args.weights == "model" else checkpoint.get("ema")
+    if weights is None:
+        raise ValueError("the checkpoint has no EMA weights; use --weights model")
     net.load_state_dict(weights, strict=True)
     del checkpoint
     net.eval().to(device="cuda", dtype=torch.bfloat16)

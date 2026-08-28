@@ -39,3 +39,9 @@ def test_default_sampler_uses_checkpoint_one_step_setting(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["generate_7k_video.py"])
 
     assert parse_args().steps == 1
+
+
+def test_weights_selector_allows_online_model(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["generate_7k_video.py", "--weights", "model"])
+
+    assert parse_args().weights == "model"
