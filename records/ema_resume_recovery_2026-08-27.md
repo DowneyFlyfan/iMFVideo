@@ -25,6 +25,9 @@ the old EMA leaves the input almost unchanged.
 - `generate_7k_video.py --weights model` explicitly selects online weights for
   this legacy checkpoint. The default EMA mode remains available for repaired
   future checkpoints.
+- `repair_checkpoint_ema.py` atomically migrates a completed legacy checkpoint
+  in place: it resets EMA from online weights, records the preconditioning
+  marker, and updates the saved resume scale to 1.0.
 
 ## Local inference result
 
