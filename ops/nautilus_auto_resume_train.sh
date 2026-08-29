@@ -36,6 +36,32 @@ if [[ ! -f "$checkpoint" ]]; then
     exit 1
 fi
 
+# The legacy 8k checkpoint was written after the old resume path scaled only
+# online Q/K producers, leaving its EMA in a different parameterization.
+# Repair it exactly once before any automatic restart; newer checkpoints carry
+# the marker written by repair_checkpoint_ema.py and are left untouched.
+if .venv/bin/python - "$checkpoint" <<'PY'
+import sys
+
+import torch
+
+checkpoint = torch.load(sys.argv[1], map_location="cpu", weights_only=True,
+                        mmap=True)
+sys.exit(not (
+    checkpoint.get("step") == 8000
+    and not checkpoint.get("linear_qk_preconditioned", False)
+))
+PY
+then
+    repair_script=repair_checkpoint_ema.py
+    if [[ ! -f "$repair_script" ]]; then
+        echo "[auto-resume] legacy 8k checkpoint needs EMA repair, but ${repair_script} is absent" >&2
+        exit 1
+    fi
+    echo "[auto-resume] repairing legacy EMA in $checkpoint" >&2
+    .venv/bin/python "$repair_script" "$checkpoint"
+fi
+
 export MFVIDEO_RESUME="$checkpoint"
 .venv/bin/python - <<'PY'
 import os
