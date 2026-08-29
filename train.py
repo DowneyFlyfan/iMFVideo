@@ -671,6 +671,7 @@ def main():
     while step < o.total_steps:
         optimizer.zero_grad(set_to_none=True)
         loss_sum = 0.0
+        raw_loss_sum = 0.0
         for _ in range(o.grad_accum):
             try:
                 latents, labels = next(data_iter)
@@ -701,6 +702,7 @@ def main():
             # Divide so the accumulated gradient is the mean over micro-batches.
             (loss / o.grad_accum).backward()
             loss_sum += loss.item() / o.grad_accum
+            raw_loss_sum += dict_losses["loss_raw"].item() / o.grad_accum
 
         if world > 1:
             all_reduce_grads(list(net.parameters()), world)
@@ -768,7 +770,7 @@ def main():
             elif math.isfinite(lu):
                 loss_u_ema = ema_beta * loss_u_ema + (1 - ema_beta) * lu
             print(
-                f"step {step} loss={loss_sum:.4f} "
+                f"step {step} loss={raw_loss_sum:.4f} objective={loss_sum:.4f} "
                 f"loss_u={lu:.4f} loss_u_ema={loss_u_ema:.4f} "
                 f"loss_v={dict_losses['loss_v'].item():.4f} "
                 f"grad_norm={grad_norm.item():.3f} lr={lr:.2e} "
@@ -782,7 +784,8 @@ def main():
 
                 wandb.log(
                     {
-                        "loss": loss_sum,
+                        "loss": raw_loss_sum,
+                        "objective": loss_sum,
                         "grad_norm": grad_norm.item(),
                         "lr": lr,
                         "samples_per_s": imgs_s,

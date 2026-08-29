@@ -13,6 +13,33 @@ import torch
 import torch.nn as nn
 
 
+def adaptive_loss_metrics(
+    loss_u,
+    loss_v,
+    *,
+    norm_eps,
+    norm_p,
+    loss_v_weight,
+    elements_per_sample,
+):
+    """Return the adaptive objective and its informative raw per-element MSE.
+
+    The inputs are per-sample squared-error sums. With ``norm_p=1``, each
+    detached-normalized objective branch is bounded below one, whereas the raw
+    mean squared error remains comparable between training steps.
+    """
+    if elements_per_sample <= 0:
+        raise ValueError("elements_per_sample must be positive")
+
+    def adaptive(branch_loss):
+        denominator = (branch_loss + norm_eps) ** norm_p
+        return branch_loss / denominator.detach()
+
+    objective = adaptive(loss_u) + loss_v_weight * adaptive(loss_v)
+    raw_metric = (loss_u + loss_v_weight * loss_v).mean() / elements_per_sample
+    return objective.mean(), raw_metric
+
+
 class IMFVideoLoss(nn.Module):
     """improved MeanFlow loss for video latents."""
 
@@ -534,36 +561,24 @@ class IMFVideoLoss(nn.Module):
 
         v_g = v_g.detach()  # (B, C, T, H, W) target carries no gradient
 
-        def adp_wt_fn(loss):
-            """Normalise each sample's loss by its own detached magnitude.
-
-            Args:
-                loss: (B,) per-sample squared error summed over C, T, H, W.
-
-            Returns:
-                (B,) reweighted loss. At norm_p = 1 the denominator is
-                loss + norm_eps, so each sample contributes gradient of scale
-                ~1 regardless of its own magnitude, which stops outliers from
-                dominating the batch.
-            """
-            adp_wt = (loss + self.norm_eps) ** self.norm_p  # (B,)
-            return loss / adp_wt.detach()
-
         # improved MeanFlow objective is conceptually v-loss
         loss_u = torch.sum((V - v_g) ** 2, dim=(1, 2, 3, 4))  # (B,)
-        loss_u = adp_wt_fn(loss_u)  # (B,)
-
         # auxiliary v-head loss
         loss_v = torch.sum((v - v_g) ** 2, dim=(1, 2, 3, 4))  # (B,)
-        loss_v = adp_wt_fn(loss_v)  # (B,)
-
-        loss = loss_u + self.loss_v_weight * loss_v  # (B,)
-        loss = loss.mean()  # scalar, mean over batch
+        loss, raw_loss = adaptive_loss_metrics(
+            loss_u,
+            loss_v,
+            norm_eps=self.norm_eps,
+            norm_p=self.norm_p,
+            loss_v_weight=self.loss_v_weight,
+            elements_per_sample=V[0].numel(),
+        )
 
         dict_losses = {
             "loss": loss.detach(),
-            "loss_u": torch.mean((V - v_g) ** 2).detach(),
-            "loss_v": torch.mean((v - v_g) ** 2).detach(),
+            "loss_raw": raw_loss.detach(),
+            "loss_u": loss_u.mean().div(V[0].numel()).detach(),
+            "loss_v": loss_v.mean().div(V[0].numel()).detach(),
         }
 
         return loss, dict_losses
