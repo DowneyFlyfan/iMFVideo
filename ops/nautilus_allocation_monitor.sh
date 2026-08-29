@@ -4,7 +4,8 @@ set -euo pipefail
 
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 namespace=ecepxie
-pod_name=gpu-dev2-55886bbcc8-kt7qm
+pod_selector=${MFVIDEO_MONITOR_SELECTOR:-app=gpu-dev2}
+pod_name_override=${MFVIDEO_MONITOR_POD_NAME:-}
 state_file=${MFVIDEO_MONITOR_STATE:-"$repo_dir/.cache/nautilus_a100_monitor.state"}
 poll_seconds=${MFVIDEO_MONITOR_POLL_SECONDS:-60}
 
@@ -20,17 +21,30 @@ fi
 mkdir -p "$(dirname "$state_file")"
 
 check_once() {
-    local phase previous title body
-    phase=$(kubectl get pod "$pod_name" -n "$namespace" \
-        -o jsonpath='{.status.phase}' 2>/dev/null || printf 'Unavailable')
+    local pod_name phase previous current title body
+    if [[ -n "$pod_name_override" ]]; then
+        pod_name=$pod_name_override
+    else
+        pod_name=$(kubectl get pods -n "$namespace" -l "$pod_selector" \
+            --field-selector='status.phase!=Succeeded,status.phase!=Failed' \
+            --sort-by=.metadata.creationTimestamp \
+            -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null || true)
+    fi
+    if [[ -z "$pod_name" ]]; then
+        phase=Unavailable
+    else
+        phase=$(kubectl get pod "$pod_name" -n "$namespace" \
+            -o jsonpath='{.status.phase}' 2>/dev/null || printf 'Unavailable')
+    fi
     [[ -n "$phase" ]] || phase=Unavailable
+    current="$pod_name $phase"
     previous=$(cat "$state_file" 2>/dev/null || true)
 
-    if [[ "$phase" != "$previous" ]]; then
+    if [[ "$current" != "$previous" ]]; then
         case "$phase" in
             Running)
                 title='Nautilus-A100 allocated'
-                body='The four-A100 pod is running; the bootstrap is resuming MFVideo.'
+                body="The four-A100 pod ${pod_name} is running; the bootstrap is resuming MFVideo."
                 ;;
             Failed|Unknown|Unavailable)
                 title='Nautilus-A100 requires attention'
@@ -44,7 +58,7 @@ check_once() {
         if [[ -n "$title" ]]; then
             notify-send -u normal "$title" "$body" || true
         fi
-        printf '%s\n' "$phase" > "$state_file"
+        printf '%s\n' "$current" > "$state_file"
     fi
 }
 
