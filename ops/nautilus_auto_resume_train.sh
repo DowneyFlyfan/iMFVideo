@@ -3,7 +3,7 @@
 # This file is mounted from the nautilus-init ConfigMap at /init.
 set -euo pipefail
 
-project_dir=/root/downeyflyfan/MFVideo
+project_dir=${MFVIDEO_PROJECT_DIR:-/root/downeyflyfan/MFVideo}
 log_file=train_linear_t2_resume.log
 
 if [[ ! -d "$project_dir" ]]; then
@@ -64,3 +64,11 @@ train_pid=$!
 echo "[auto-resume] training pid=$train_pid" >&2
 nohup ./gpu_heartbeat_watchdog.sh "$train_pid" \
     >> gpu-heartbeat-watchdog.log 2>&1 < /dev/null &
+
+# The heartbeat keeps the allocation occupied after a failure; the supervisor
+# additionally resumes training from the newest incomplete checkpoint.
+if [[ -x ./ops/nautilus_train_supervisor.sh ]] \
+    && ! pgrep -f '[n]autilus_train_supervisor.sh' >/dev/null; then
+    nohup ./ops/nautilus_train_supervisor.sh \
+        >> train-supervisor.log 2>&1 < /dev/null &
+fi

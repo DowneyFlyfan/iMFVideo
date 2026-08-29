@@ -11,5 +11,8 @@ auto-resume script. It exits instead when the latest checkpoint has reached
 the configured total, so successful training is never restarted.
 
 The shell regression test covers the filename-to-step parser and completion
-gate. Deployment is separate from the Pod bootstrap so it can be introduced
-without interrupting an active run.
+gate. A second isolated bootstrap test proves that Pod initialization starts
+torchrun, the GPU heartbeat, and this supervisor together. The updated
+`nautilus_auto_resume_train.sh` was merged into the live `nautilus-init`
+ConfigMap without restarting the current Pod; its remote SHA-256 matches the
+local script.
