@@ -46,3 +46,9 @@ The old host `node-1-3.sdsc.optiputer.net` became NotReady and exposed no
 healthy A100/CSI driver.  The Deployment created replacement Pod
 `gpu-dev2-55886bbcc8-xdmqq`, requesting four A100 GPUs.  Its bootstrap will
 perform the repair only after the scheduler assigns a healthy node.
+
+The persistent local allocation monitor now resolves the newest non-terminal
+`app=gpu-dev2` Pod rather than retaining the obsolete Pod name.  Its durable
+state includes both Pod name and phase, so a replacement transition to
+`Running` emits a new Nautilus-A100 allocation notification even if the old
+Pod had previously been running.
