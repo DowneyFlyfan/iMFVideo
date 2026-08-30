@@ -6,6 +6,7 @@ repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 namespace=ecepxie
 pod_selector=${MFVIDEO_MONITOR_SELECTOR:-app=gpu-dev2}
 pod_name_override=${MFVIDEO_MONITOR_POD_NAME:-}
+on_running=${MFVIDEO_MONITOR_ON_RUNNING:-}
 state_file=${MFVIDEO_MONITOR_STATE:-"$repo_dir/.cache/nautilus_a100_monitor.state"}
 poll_seconds=${MFVIDEO_MONITOR_POLL_SECONDS:-60}
 
@@ -57,6 +58,9 @@ check_once() {
         esac
         if [[ -n "$title" ]]; then
             notify-send -u normal "$title" "$body" || true
+        fi
+        if [[ "$phase" == Running && -n "$on_running" ]]; then
+            "$on_running" "$pod_name" || true
         fi
         printf '%s\n' "$current" > "$state_file"
     fi
