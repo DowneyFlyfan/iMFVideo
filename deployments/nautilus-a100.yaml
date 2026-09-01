@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-dev2
+  namespace: ecepxie
+  labels:
+    app: gpu-dev2
+    ecepxie.nrp/owner: downeyflyfan
+spec:
+  replicas: 1
+  revisionHistoryLimit: 10
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: gpu-dev2
+  template:
+    metadata:
+      labels:
+        app: gpu-dev2
+        ecepxie.nrp/owner: downeyflyfan
+    spec:
+      # Bypass the namespace's standard A100 quota while retaining the exact
+      # four-GPU request.  Nautilus may preempt this lower-priority workload.
+      priorityClassName: opportunistic
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A100-SXM4-80GB
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+      containers:
+        - name: gpu-dev2
+          image: nvcr.io/nvidia/pytorch:24.05-py3
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "/init/init.sh"]
+          resources:
+            requests:
+              cpu: "8"
+              memory: 32Gi
+              ephemeral-storage: 64Gi
+              nvidia.com/a100: "4"
+            limits:
+              cpu: "16"
+              memory: 64Gi
+              ephemeral-storage: 128Gi
+              nvidia.com/a100: "4"
+          volumeMounts:
+            - name: home
+              mountPath: /root
+            - name: init
+              mountPath: /init
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: home
+          persistentVolumeClaim:
+            claimName: yuw-home
+        - name: init
+          configMap:
+            name: nautilus-init
+            defaultMode: 493
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
