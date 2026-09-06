@@ -44,6 +44,11 @@ stop_heartbeat_fallback() {
     fallback_pids=$(ps -eo pid=,args= | awk \
         '/torch\.mm\(mat, mat, out=out\)/ && /4096/ {print $1}')
     [[ -z $fallback_pids ]] || kill $fallback_pids 2>/dev/null || true
+
+    fallback_pids=$(ps -eo pid=,comm=,args= | awk \
+        '$2 ~ /^python/ && /a100_goal_filler/ {print $1}')
+    [[ -z $fallback_pids ]] || kill $fallback_pids 2>/dev/null || true
+
 }
 
 main() {
