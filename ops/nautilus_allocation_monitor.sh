@@ -7,6 +7,7 @@ namespace=ecepxie
 pod_selector=${MFVIDEO_MONITOR_SELECTOR:-app=gpu-dev2}
 pod_name_override=${MFVIDEO_MONITOR_POD_NAME:-}
 on_running=${MFVIDEO_MONITOR_ON_RUNNING:-}
+on_health_check=${MFVIDEO_MONITOR_ON_HEALTH_CHECK:-}
 state_file=${MFVIDEO_MONITOR_STATE:-"$repo_dir/.cache/nautilus_a100_monitor.state"}
 poll_seconds=${MFVIDEO_MONITOR_POLL_SECONDS:-60}
 
@@ -40,6 +41,13 @@ check_once() {
     [[ -n "$phase" ]] || phase=Unavailable
     current="$pod_name $phase"
     previous=$(cat "$state_file" 2>/dev/null || true)
+
+    # Check a live run on every poll, not just at the allocation transition.
+    # The remote checker is fail-closed only after repeated post-resume NaNs.
+    if [[ "$phase" == Running && -n "$on_health_check" ]]; then
+        kubectl -n "$namespace" exec "$pod_name" -- bash "$on_health_check" \
+            >/dev/null 2>&1 || true
+    fi
 
     if [[ "$current" != "$previous" ]]; then
         case "$phase" in

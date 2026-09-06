@@ -33,11 +33,13 @@ export MFVIDEO_NOTIFY_LOG="$work_dir/notifications"
 export MFVIDEO_KUBECTL_LOG="$work_dir/kubectl.log"
 export MFVIDEO_MONITOR_ON_RUNNING="$work_dir/bin/on-running"
 export MFVIDEO_RECOVERY_LOG="$work_dir/recovery.log"
+export MFVIDEO_MONITOR_ON_HEALTH_CHECK='/root/downeyflyfan/MFVideo/ops/nautilus_training_health_check.sh'
 
 bash "$monitor" --once
 
 grep -Fq 'Nautilus-A100 allocated' "$MFVIDEO_NOTIFY_LOG"
 grep -Fxq 'gpu-dev2-55886bbcc8-replacement Running' "$MFVIDEO_MONITOR_STATE"
 grep -Fq 'get pods -n ecepxie -l app=gpu-dev2' "$MFVIDEO_KUBECTL_LOG"
+grep -Fq -- '-n ecepxie exec gpu-dev2-55886bbcc8-replacement -- bash /root/downeyflyfan/MFVideo/ops/nautilus_training_health_check.sh' "$MFVIDEO_KUBECTL_LOG"
 grep -Fxq 'gpu-dev2-55886bbcc8-replacement' "$MFVIDEO_RECOVERY_LOG"
 printf 'PASS: allocation transition sends one notification and records state\n'
