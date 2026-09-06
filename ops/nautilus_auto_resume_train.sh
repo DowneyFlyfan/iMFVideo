@@ -13,6 +13,16 @@ fi
 
 cd "$project_dir"
 
+# Both the mounted Pod bootstrap and the allocation monitor can invoke this
+# script during a fresh start.  Only one may materialize checkpoint config and
+# launch torchrun; the other must leave the shared PVC untouched.
+mkdir -p .cache
+exec 9>.cache/nautilus-auto-resume.lock
+if ! flock -n 9; then
+    echo '[auto-resume] another recovery invocation owns the resume lock' >&2
+    exit 0
+fi
+
 if pgrep -f '[t]orchrun.*train.py' >/dev/null; then
     echo "[auto-resume] training already exists; not starting a duplicate" >&2
     exit 0
