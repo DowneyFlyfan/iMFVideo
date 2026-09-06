@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import pprint
 import re
@@ -41,13 +42,19 @@ def render_config(saved_config: dict[str, dict[str, object]]) -> str:
     return "config = Config(\n" + "\n".join(sections) + "\n)"
 
 
-def restore(checkpoint_path: Path, config_path: Path) -> None:
+def restore(checkpoint_path: Path, config_path: Path, resume: str | None) -> None:
     checkpoint = torch.load(
         checkpoint_path, map_location="cpu", weights_only=True, mmap=True
     )
     saved_config = checkpoint.get("config")
     if not isinstance(saved_config, dict):
         raise ValueError(f"{checkpoint_path} has no dictionary config")
+    saved_config = copy.deepcopy(saved_config)
+    if resume is not None:
+        run_config = saved_config.get("run")
+        if not isinstance(run_config, dict):
+            raise ValueError("checkpoint config.run must be a dictionary")
+        run_config["resume"] = resume
 
     source = config_path.read_text()
     restored, count = CONFIG_ASSIGNMENT.subn(render_config(saved_config), source, count=1)
@@ -66,8 +73,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("config", type=Path)
+    parser.add_argument("--resume")
     args = parser.parse_args()
-    restore(args.checkpoint, args.config)
+    restore(args.checkpoint, args.config, args.resume)
 
 
 if __name__ == "__main__":

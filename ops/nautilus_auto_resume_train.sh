@@ -23,14 +23,9 @@ if [[ ! -x .venv/bin/torchrun ]]; then
     exit 1
 fi
 
-# The requested stable restart point is step 7000.  Prefer a later checkpoint
-# only when it really exists, so a completed checkpoint is never overwritten.
+# The user-selected stable restart point is step 7000.  Its saved optimizer and
+# T2 preconditioner settings must remain paired with this exact checkpoint.
 checkpoint=checkpoints/step_0007000.pt
-latest_checkpoint=$(find checkpoints -maxdepth 1 -type f -name 'step_*.pt' \
-    -printf '%f\n' 2>/dev/null | sort -V | tail -n 1 || true)
-if [[ -n "$latest_checkpoint" ]]; then
-    checkpoint="checkpoints/$latest_checkpoint"
-fi
 if [[ ! -f "$checkpoint" ]]; then
     echo "[auto-resume] no usable checkpoint found under checkpoints/" >&2
     exit 1
@@ -54,13 +49,34 @@ then
         echo "[auto-resume] missing ${config_restore_script}" >&2
         exit 1
     fi
-    .venv/bin/python "$config_restore_script" "$checkpoint" config.py
+    .venv/bin/python "$config_restore_script" "$checkpoint" config.py \
+        --resume "$checkpoint"
+else
+    export MFVIDEO_RESUME="$checkpoint"
+    .venv/bin/python - <<'PY'
+import os
+import re
+from pathlib import Path
+
+path = Path("config.py")
+text = path.read_text()
+resume = os.environ["MFVIDEO_RESUME"]
+updated, count = re.subn(
+    r'^(\s*resume:\s*str\s*=\s*)"[^"]*"(\s*(?:#.*)?)$',
+    lambda match: f'{match.group(1)}"{resume}"{match.group(2)}',
+    text,
+    count=1,
+    flags=re.MULTILINE,
+)
+if count != 1:
+    raise RuntimeError("config.py must contain exactly one RunConfig.resume field")
+path.write_text(updated)
+PY
 fi
 
 # The legacy 8k checkpoint was written after the old resume path scaled only
 # online Q/K producers, leaving its EMA in a different parameterization.
-# Repair it exactly once before any automatic restart; newer checkpoints carry
-# the marker written by repair_checkpoint_ema.py and are left untouched.
+# The selected 7k checkpoint is never migrated as 8k.
 if .venv/bin/python - "$checkpoint" <<'PY'
 import sys
 
@@ -82,27 +98,6 @@ then
     echo "[auto-resume] repairing legacy EMA in $checkpoint" >&2
     .venv/bin/python "$repair_script" "$checkpoint"
 fi
-
-export MFVIDEO_RESUME="$checkpoint"
-.venv/bin/python - <<'PY'
-import os
-import re
-from pathlib import Path
-
-path = Path("config.py")
-text = path.read_text()
-resume = os.environ["MFVIDEO_RESUME"]
-updated, count = re.subn(
-    r'^(\s*resume:\s*str\s*=\s*)"[^"]*"(\s*(?:#.*)?)$',
-    lambda match: f'{match.group(1)}"{resume}"{match.group(2)}',
-    text,
-    count=1,
-    flags=re.MULTILINE,
-)
-if count != 1:
-    raise RuntimeError("config.py must contain exactly one RunConfig.resume field")
-path.write_text(updated)
-PY
 
 echo "[auto-resume] resuming from $checkpoint" >&2
 nohup .venv/bin/torchrun --nproc-per-node 4 train.py \

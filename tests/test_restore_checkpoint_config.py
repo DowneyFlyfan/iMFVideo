@@ -31,7 +31,7 @@ config = Config()
                 "data": {"latent_frames": 31, "latent_size": (44, 80)},
                 "loss": {"autocast_bf16": True},
                 "optim": {"total_steps": 10000},
-                "run": {"resume": "checkpoints/step_0007000.pt"},
+                "run": {"resume": "checkpoints/step_0008000.pt"},
                 "sample": {"num_steps": 1},
             },
         },
@@ -40,7 +40,14 @@ config = Config()
 
     repo = Path(__file__).resolve().parents[1]
     subprocess.run(
-        [sys.executable, "restore_checkpoint_config.py", str(checkpoint), str(template)],
+        [
+            sys.executable,
+            "restore_checkpoint_config.py",
+            str(checkpoint),
+            str(template),
+            "--resume",
+            "checkpoints/step_0007000.pt",
+        ],
         check=True,
         cwd=repo,
     )

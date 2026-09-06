@@ -7,7 +7,6 @@ trap 'rm -rf "$work_dir"' EXIT
 project_dir="$work_dir/project"
 mkdir -p "$project_dir/.venv/bin" "$project_dir/checkpoints" "$project_dir/ops" \
     "$work_dir/bin"
-touch "$project_dir/checkpoints/step_0007000.pt"
 printf '    resume: str = ""\n' > "$project_dir/config.py"
 ln -s "$repo_dir/.venv/bin/python" "$project_dir/.venv/bin/python"
 PROJECT_DIR="$project_dir" "$project_dir/.venv/bin/python" - <<'PY'
@@ -16,6 +15,15 @@ from pathlib import Path
 
 import torch
 
+torch.save(
+    {
+        "step": 7000,
+        "model": {"weight": torch.ones(1)},
+        "ema": {"weight": torch.ones(1)},
+        "optimizer": {},
+    },
+    Path(os.environ["PROJECT_DIR"]) / "checkpoints/step_0007000.pt",
+)
 torch.save(
     {
         "step": 8000,
@@ -58,6 +66,6 @@ sleep 0.1
 grep -Fq '.venv/bin/torchrun --nproc-per-node 4 train.py' "$MFVIDEO_NOHUP_LOG"
 grep -Fq './gpu_heartbeat_watchdog.sh' "$MFVIDEO_NOHUP_LOG"
 grep -Fq './ops/nautilus_train_supervisor.sh' "$MFVIDEO_NOHUP_LOG"
-grep -Fq 'resume: str = "checkpoints/step_0008000.pt"' "$project_dir/config.py"
-grep -Fxq 'checkpoints/step_0008000.pt' "$MFVIDEO_REPAIR_LOG"
+grep -Fq 'resume: str = "checkpoints/step_0007000.pt"' "$project_dir/config.py"
+test ! -s "$MFVIDEO_REPAIR_LOG"
 printf 'PASS: boot recovery launches training, heartbeat, and supervisor\n'

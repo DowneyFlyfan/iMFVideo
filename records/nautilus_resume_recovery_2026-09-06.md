@@ -19,19 +19,24 @@ channels, 31 latent frames, latent size `(44, 80)`, four samples per GPU, and
 configuration and must not be replaced by those defaults.
 
 `restore_checkpoint_config.py` now atomically materializes the configuration
-recorded in a checkpoint into a synchronized `config.py` template.  The
-recovery hook synchronizes the template and materializer before launching, and
-the launcher restores the stored configuration when available.  Tests cover
-config materialization, synchronization of `config.py`, and the existing
-automatic-resume behavior.
+recorded in the selected checkpoint into a synchronized `config.py` template.
+The recovery hook synchronizes the template and materializer before launching.
+The launcher is pinned to the requested 7k checkpoint and passes that same
+path as the materializer's effective `RunConfig.resume`; it no longer uses an
+8k configuration with a 7k model/optimizer state.  Tests cover config
+materialization, synchronization of `config.py`, and the automatic-resume
+selection behavior.
 
 ## Runtime evidence
 
-The corrected launch built the 290.1M-parameter model and restored step 7000,
-with the intended 48-by-31-by-44-by-80 input geometry.  Steps 7001 and 7002
-had non-finite gradients and were skipped; neither performed an optimizer
-update.  The affected node then became `NodeNotReady`, making `kubectl exec`
-time out.  The unhealthy Pod must be replaced before further T2 diagnosis.
+The first corrected launch built the 290.1M-parameter model and restored step
+7000, with the intended 48-by-31-by-44-by-80 input geometry.  Its two
+non-finite-gradient skips did not update weights.  Their direct cause was then
+identified: the 7k checkpoint stores `resume_linear_qk_scale=0.3`, but the
+old launcher had materialized the latest 8k configuration with scale 1.0 while
+the actual runtime `RunConfig.resume` still pointed to 7k.  The affected node
+then became `NodeNotReady`, making `kubectl exec` time out.  The unhealthy Pod
+was replaced before further training.
 
 While no training process is live, each allocated A100 runs one verified
 24,576-by-24,576 BF16 random matrix-multiplication filler.  The synchronization
