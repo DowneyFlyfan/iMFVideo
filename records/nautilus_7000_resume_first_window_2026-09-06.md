@@ -48,3 +48,22 @@ At step 7100, the run remained finite and at the same 0.5 samples/s:
 
 The two 50-step windows establish finite, non-skipped optimization over 100
 steps after the formerly explosive checkpoint boundary.
+
+## Third verified window
+
+At step 7150, optimization remained finite:
+
+| metric | value |
+| --- | ---: |
+| loss | 0.9041 |
+| loss_u | 0.4610 |
+| loss_u EMA | 0.4318 |
+| loss_v | 0.4430 |
+| gradient norm | 1.213 |
+| QK-Clip | 0 / 8 |
+| phi-Clip | 8 / 8.5 / 0.985 |
+| throughput | 0.5 samples/s |
+
+The resumed run has now completed 150 finite steps (7001 through 7150) at the
+historical full-resolution throughput, with no recurrence of the old T2/QK
+gradient explosion.
