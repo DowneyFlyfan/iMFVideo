@@ -31,3 +31,20 @@ This contrasts with the prior uncorrected resume, which produced non-finite
 gradients at steps 7001 and 7002.  The observed throughput matches the prior
 full-resolution A100 baseline; the long first logging window is expected, not
 a hang.
+
+## Second verified window
+
+At step 7100, the run remained finite and at the same 0.5 samples/s:
+
+| metric | value |
+| --- | ---: |
+| loss | 0.8940 |
+| loss_u | 0.4703 |
+| loss_u EMA | 0.4245 |
+| loss_v | 0.4237 |
+| gradient norm | 0.730 |
+| QK-Clip | 0 / 8 |
+| phi-Clip | 8 / 8.5 / 0.978 |
+
+The two 50-step windows establish finite, non-skipped optimization over 100
+steps after the formerly explosive checkpoint boundary.
