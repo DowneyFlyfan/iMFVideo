@@ -21,6 +21,8 @@ bash "$repo_dir/ops/nautilus_sync_and_resume.sh" gpu-dev2-test
 
 grep -Fq "cp $repo_dir/train.py ecepxie/gpu-dev2-test:/root/downeyflyfan/MFVideo/train.py" "$MFVIDEO_KUBECTL_LOG"
 grep -Fq "cp $repo_dir/imf_video.py ecepxie/gpu-dev2-test:/root/downeyflyfan/MFVideo/imf_video.py" "$MFVIDEO_KUBECTL_LOG"
+grep -Fq "cp $repo_dir/config.py ecepxie/gpu-dev2-test:/root/downeyflyfan/MFVideo/config.py" "$MFVIDEO_KUBECTL_LOG"
 grep -Fq "cp $repo_dir/models ecepxie/gpu-dev2-test:/root/downeyflyfan/MFVideo" "$MFVIDEO_KUBECTL_LOG"
 grep -Fq 'exec -i gpu-dev2-test -- bash -s' "$MFVIDEO_KUBECTL_LOG"
+grep -Fq 'a100_goal_filler' "$repo_dir/ops/nautilus_sync_and_resume.sh"
 printf 'PASS: allocation recovery syncs local code and restarts the pod job\n'

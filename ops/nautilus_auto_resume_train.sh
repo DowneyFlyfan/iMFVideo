@@ -36,6 +36,27 @@ if [[ ! -f "$checkpoint" ]]; then
     exit 1
 fi
 
+# The shared PVC can retain a stale or damaged config.py from a prior pod.
+# Rebuild the server config from the checkpoint before launching so the model
+# architecture, input geometry, and optimizer schedule remain checkpoint-safe.
+config_restore_script=restore_checkpoint_config.py
+if .venv/bin/python - "$checkpoint" <<'PY'
+import sys
+
+import torch
+
+checkpoint = torch.load(sys.argv[1], map_location="cpu", weights_only=True,
+                        mmap=True)
+sys.exit(not isinstance(checkpoint.get("config"), dict))
+PY
+then
+    if [[ ! -f "$config_restore_script" ]]; then
+        echo "[auto-resume] missing ${config_restore_script}" >&2
+        exit 1
+    fi
+    .venv/bin/python "$config_restore_script" "$checkpoint" config.py
+fi
+
 # The legacy 8k checkpoint was written after the old resume path scaled only
 # online Q/K producers, leaving its EMA in a different parameterization.
 # Repair it exactly once before any automatic restart; newer checkpoints carry

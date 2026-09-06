@@ -27,7 +27,8 @@ for ((attempt = 1; attempt <= ready_attempts; attempt++)); do
 done
 
 log "synchronizing verified local source to $pod_name"
-for source_file in train.py imf_video.py moonlight.py repair_checkpoint_ema.py \
+for source_file in config.py train.py imf_video.py moonlight.py \
+                   repair_checkpoint_ema.py restore_checkpoint_config.py \
                    gpu_heartbeat_watchdog.sh; do
     kubectl -n "$namespace" cp "$repo_dir/$source_file" \
         "$namespace/$pod_name:$project_dir/$source_file"
@@ -57,6 +58,19 @@ fi
 fallback_pids=$(ps -eo pid=,args= | awk \
     '/torch\.mm\(mat, mat, out=out\)/ && /4096/ {print $1}')
 [[ -z "$fallback_pids" ]] || kill -TERM $fallback_pids || true
+filler_pids=$(ps -eo pid=,comm=,args= | awk \
+    '$2 ~ /^python/ && /a100_goal_filler/ {print $1}')
+[[ -z "$filler_pids" ]] || kill -TERM $filler_pids || true
+for _ in $(seq 1 12); do
+    filler_left=$(ps -eo comm=,args= | awk \
+        '$1 ~ /^python/ && /a100_goal_filler/ {found=1} END {print found ? 1 : 0}')
+    [[ "$filler_left" == 0 ]] && break
+    sleep 1
+done
+if [[ "$filler_left" != 0 ]]; then
+    echo '[nautilus-sync-resume] named A100 filler did not stop' >&2
+    exit 1
+fi
 chmod 755 gpu_heartbeat_watchdog.sh ops/nautilus_auto_resume_train.sh \
     ops/nautilus_train_supervisor.sh
 ./ops/nautilus_auto_resume_train.sh
