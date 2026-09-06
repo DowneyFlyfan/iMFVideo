@@ -67,3 +67,21 @@ At step 7150, optimization remained finite:
 The resumed run has now completed 150 finite steps (7001 through 7150) at the
 historical full-resolution throughput, with no recurrence of the old T2/QK
 gradient explosion.
+
+## Fourth verified window
+
+At step 7200, the fourth window remained finite at 0.5 samples/s:
+
+| metric | value |
+| --- | ---: |
+| loss | 0.9591 |
+| loss_u | 0.4936 |
+| loss_u EMA | 0.4442 |
+| loss_v | 0.4655 |
+| gradient norm | 0.698 |
+| QK-Clip | 0 / 7 |
+| phi-Clip | 7 / 8.5 / 0.983 |
+
+Thus 200 consecutive post-resume steps are finite and non-skipped.  The
+occasional bounded phi-Clip response is expected; its factor remains near one
+and no QK-Clip or non-finite guard has fired.
