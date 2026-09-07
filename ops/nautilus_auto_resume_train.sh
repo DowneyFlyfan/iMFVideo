@@ -33,36 +33,38 @@ if [[ ! -x .venv/bin/torchrun ]]; then
     exit 1
 fi
 
-# Step 7000 is the stable baseline.  A later checkpoint is eligible only after
-# the corrected Q/K parameterization has been recorded inside it; this excludes
-# the legacy 8k artifact whose Exponential Moving Average is mismatched.
-baseline_checkpoint=checkpoints/step_0007000.pt
-if [[ ! -f "$baseline_checkpoint" ]]; then
-    echo "[auto-resume] no usable checkpoint found under checkpoints/" >&2
+# The requested restart point is step 8000.  Older step-8000 files may need
+# an EMA repair before their saved configuration is materialized below.
+checkpoint=checkpoints/step_0008000.pt
+if [[ ! -f "$checkpoint" ]]; then
+    echo "[auto-resume] requested checkpoint $checkpoint is absent" >&2
     exit 1
 fi
-checkpoint=$(.venv/bin/python - "$baseline_checkpoint" <<'PY'
+
+# The legacy 8k checkpoint scaled only online Q/K producers, leaving its EMA
+# in a different parameterization.  Repair it before generating config.py so
+# the restored resume scale and the checkpoint state remain paired.
+if .venv/bin/python - "$checkpoint" <<'PY'
 import sys
-from pathlib import Path
 
 import torch
 
-baseline = Path(sys.argv[1])
-selected = baseline
-for candidate in sorted(baseline.parent.glob("step_*.pt"), reverse=True):
-    try:
-        state = torch.load(candidate, map_location="cpu", weights_only=True,
-                           mmap=True)
-    except (OSError, RuntimeError, ValueError):
-        continue
-    if (isinstance(state, dict)
-            and state.get("step", -1) > 7000
-            and state.get("linear_qk_preconditioned", False)):
-        selected = candidate
-        break
-print(selected)
+checkpoint = torch.load(sys.argv[1], map_location="cpu", weights_only=True,
+                        mmap=True)
+sys.exit(not (
+    checkpoint.get("step") == 8000
+    and not checkpoint.get("linear_qk_preconditioned", False)
+))
 PY
-)
+then
+    repair_script=repair_checkpoint_ema.py
+    if [[ ! -f "$repair_script" ]]; then
+        echo "[auto-resume] legacy 8k checkpoint needs EMA repair, but ${repair_script} is absent" >&2
+        exit 1
+    fi
+    echo "[auto-resume] repairing legacy EMA in $checkpoint" >&2
+    .venv/bin/python "$repair_script" "$checkpoint"
+fi
 
 # The shared PVC can retain a stale or damaged config.py from a prior pod.
 # Rebuild the server config from the checkpoint before launching so the model
@@ -105,31 +107,6 @@ if count != 1:
     raise RuntimeError("config.py must contain exactly one RunConfig.resume field")
 path.write_text(updated)
 PY
-fi
-
-# The legacy 8k checkpoint was written after the old resume path scaled only
-# online Q/K producers, leaving its EMA in a different parameterization.
-# The selected 7k checkpoint is never migrated as 8k.
-if .venv/bin/python - "$checkpoint" <<'PY'
-import sys
-
-import torch
-
-checkpoint = torch.load(sys.argv[1], map_location="cpu", weights_only=True,
-                        mmap=True)
-sys.exit(not (
-    checkpoint.get("step") == 8000
-    and not checkpoint.get("linear_qk_preconditioned", False)
-))
-PY
-then
-    repair_script=repair_checkpoint_ema.py
-    if [[ ! -f "$repair_script" ]]; then
-        echo "[auto-resume] legacy 8k checkpoint needs EMA repair, but ${repair_script} is absent" >&2
-        exit 1
-    fi
-    echo "[auto-resume] repairing legacy EMA in $checkpoint" >&2
-    .venv/bin/python "$repair_script" "$checkpoint"
 fi
 
 echo "[auto-resume] resuming from $checkpoint" >&2

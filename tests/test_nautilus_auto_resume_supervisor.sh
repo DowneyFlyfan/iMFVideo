@@ -66,6 +66,6 @@ sleep 0.1
 grep -Fq '.venv/bin/torchrun --nproc-per-node 4 train.py' "$MFVIDEO_NOHUP_LOG"
 grep -Fq './gpu_heartbeat_watchdog.sh' "$MFVIDEO_NOHUP_LOG"
 grep -Fq './ops/nautilus_train_supervisor.sh' "$MFVIDEO_NOHUP_LOG"
-grep -Fq 'resume: str = "checkpoints/step_0007000.pt"' "$project_dir/config.py"
-test ! -s "$MFVIDEO_REPAIR_LOG"
-printf 'PASS: boot recovery launches training, heartbeat, and supervisor\n'
+grep -Fq 'resume: str = "checkpoints/step_0008000.pt"' "$project_dir/config.py"
+grep -Fq 'checkpoints/step_0008000.pt' "$MFVIDEO_REPAIR_LOG"
+printf 'PASS: boot recovery repairs and launches from the requested 8k checkpoint\n'
