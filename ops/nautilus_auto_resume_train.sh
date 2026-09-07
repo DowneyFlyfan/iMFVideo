@@ -33,13 +33,36 @@ if [[ ! -x .venv/bin/torchrun ]]; then
     exit 1
 fi
 
-# The user-selected stable restart point is step 7000.  Its saved optimizer and
-# T2 preconditioner settings must remain paired with this exact checkpoint.
-checkpoint=checkpoints/step_0007000.pt
-if [[ ! -f "$checkpoint" ]]; then
+# Step 7000 is the stable baseline.  A later checkpoint is eligible only after
+# the corrected Q/K parameterization has been recorded inside it; this excludes
+# the legacy 8k artifact whose Exponential Moving Average is mismatched.
+baseline_checkpoint=checkpoints/step_0007000.pt
+if [[ ! -f "$baseline_checkpoint" ]]; then
     echo "[auto-resume] no usable checkpoint found under checkpoints/" >&2
     exit 1
 fi
+checkpoint=$(.venv/bin/python - "$baseline_checkpoint" <<'PY'
+import sys
+from pathlib import Path
+
+import torch
+
+baseline = Path(sys.argv[1])
+selected = baseline
+for candidate in sorted(baseline.parent.glob("step_*.pt"), reverse=True):
+    try:
+        state = torch.load(candidate, map_location="cpu", weights_only=True,
+                           mmap=True)
+    except (OSError, RuntimeError, ValueError):
+        continue
+    if (isinstance(state, dict)
+            and state.get("step", -1) > 7000
+            and state.get("linear_qk_preconditioned", False)):
+        selected = candidate
+        break
+print(selected)
+PY
+)
 
 # The shared PVC can retain a stale or damaged config.py from a prior pod.
 # Rebuild the server config from the checkpoint before launching so the model
