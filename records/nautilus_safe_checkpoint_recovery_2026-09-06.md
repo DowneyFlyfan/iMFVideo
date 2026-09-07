@@ -32,3 +32,8 @@ health-monitor tests also pass.
 The current running job is not restarted.  The new selection is used only by
 the next recovery invocation, after the local script has been synchronized to
 the shared Persistent Volume Claim.
+
+The Kubernetes `nautilus-init` ConfigMap was also updated to the same script
+and verified by matching SHA-256 digests.  Consequently the Pod bootstrap has
+the same safe selection behavior even if the local allocation monitor is not
+available at the instant the scheduler assigns a node.
