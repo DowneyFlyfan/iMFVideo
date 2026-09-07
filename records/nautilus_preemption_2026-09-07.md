@@ -24,3 +24,18 @@ The local allocation monitor remains active.  It detects a newly Running Pod,
 synchronizes the checked-out recovery scripts, and starts the supervised
 resume path.  Because no corrected post-7k checkpoint has been saved yet,
 the next run will correctly resume from `checkpoints/step_0007000.pt`.
+
+## Bootstrap latency correction
+
+The original ConfigMap bootstrap performed package installation and optional
+terminal-tool setup before it invoked the recovery script.  The second
+allocated Pod was preempted only about 85 seconds after it started, so this
+ordering could lose an entire allocation without beginning training.
+
+`ops/nautilus_init.sh` is now versioned locally and invokes
+`/init/nautilus_auto_resume_train.sh` immediately after environment setup,
+before `apt-get update`.  Non-critical package and SSH provisioning continue
+in parallel with the guarded recovery task.  The ConfigMap was updated while
+the replacement Pod was Pending and verified by matching SHA-256 digests.
+`tests/test_nautilus_init_starts_training_first.sh` proves the ordering;
+syntax and recovery-lock tests pass.
