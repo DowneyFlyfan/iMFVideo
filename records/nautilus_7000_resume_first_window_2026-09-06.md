@@ -6,7 +6,7 @@
 - Checkpoint: `checkpoints/step_0007000.pt`.
 - Latents: 48 channels, 31 frames, 44 by 80.
 - Optimizer schedule: 10,000 total steps; batch 4 per GPU; no gradient
-  accumulation.
+  accumulation; checkpoint every 1,000 steps (next save at step 8000).
 - Resume Q/K preconditioner: scale 0.3 on 23 modules, applied to online
   weights, Exponential Moving Average weights, and optimizer state on all four
   ranks.
